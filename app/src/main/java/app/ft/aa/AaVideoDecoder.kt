@@ -221,28 +221,51 @@ class AaVideoDecoder(private val width: Int, private val height: Int) {
         val c = codec ?: return
         if (!running.get()) return
 
+        var inputIndex = -1
+        var inputQueued = false
         try {
-            val idx = c.dequeueInputBuffer(20_000)
-            if (idx < 0) return
-            val buf = c.getInputBuffer(idx) ?: return
+            inputIndex = c.dequeueInputBuffer(20_000)
+            if (inputIndex < 0) return
+
+            val buf = c.getInputBuffer(inputIndex)
+            if (buf == null) {
+                DiagLog.w(tag, "decoder returned a null input buffer; returning the slot")
+                c.queueInputBuffer(inputIndex, 0, 0, ptsUs, 0)
+                inputQueued = true
+                return
+            }
+
             buf.clear()
             if (data.size > buf.remaining()) {
                 DiagLog.w(
                     tag,
-                    "decoder input buffer too small: data=${data.size} remaining=${buf.remaining()}"
+                    "decoder input buffer too small: data=${data.size} remaining=${buf.remaining()}; dropping packet"
                 )
+                // A dequeued input slot must be returned even when this packet cannot fit.
+                c.queueInputBuffer(inputIndex, 0, 0, ptsUs, 0)
+                inputQueued = true
                 return
             }
+
             buf.put(data)
             c.queueInputBuffer(
-                idx,
+                inputIndex,
                 0,
                 data.size,
                 ptsUs,
                 if (isConfig) MediaCodec.BUFFER_FLAG_CODEC_CONFIG else 0
             )
+            inputQueued = true
         } catch (t: Throwable) {
             DiagLog.e(tag, "feed failed", t)
+            // If an error occurred after dequeueInputBuffer(), avoid permanently losing
+            // the input slot. If the codec has already accepted it, this attempt simply fails.
+            if (inputIndex >= 0 && !inputQueued) {
+                runCatching { c.queueInputBuffer(inputIndex, 0, 0, ptsUs, 0) }
+                    .onFailure {
+                        DiagLog.w(tag, "could not return failed input slot: ${it.message}")
+                    }
+            }
         }
     }
 
