@@ -30,6 +30,7 @@ import app.ft.aa.AaHeadUnitService
 import app.ft.aa.AaSession
 import app.ft.core.CarAudioBus
 import app.ft.core.DiagLog
+import app.ft.core.DiagSnapshot
 import app.ft.core.Root
 import app.ft.core.RootPrep
 import app.ft.media.CarPlayer
@@ -72,7 +73,8 @@ data class CarState(
     val refused: String = "",
     val waitingForShare: Boolean = false,
     val shareForSound: Boolean = false,
-    val notice: String = ""
+    val notice: String = "",
+    val usb: Boolean = false
 )
 
 class CarLifeService : Service() {
@@ -82,6 +84,8 @@ class CarLifeService : Service() {
         const val ACTION_STOP = "app.ft.carlife.STOP"
         const val ACTION_AUDIO = "app.ft.carlife.AUDIO"
         const val ACTION_SHARE_DECLINED = "app.ft.carlife.SHARE_DECLINED"
+        const val ACTION_USB = "app.ft.carlife.USB"
+        private const val USB_PERMISSION = "app.ft.carlife.USB_PERMISSION"
         private val AA_KEYS = setOf(3, 4, 19, 20, 21, 22, 23, 84, 85, 86, 87, 88, 126, 127)
         private val MEDIA_KEYS = setOf(85, 87, 88, 126, 127)
         private const val CHANNEL = "ft_carlife"
@@ -96,6 +100,9 @@ class CarLifeService : Service() {
         private const val QUIET_LEVEL = 300
         private const val SOUND_REPORT_MS = 10_000L
         private const val GOODBYE_WAIT_MS = 300L
+        private const val USB_QUICK_END_MS = 5_000L
+        private const val USB_QUIET_MS = 10_000L
+        private const val TEST_CABLE_PORT = 7300
 
         private val _state = MutableStateFlow(CarState())
         val state: StateFlow<CarState> = _state
@@ -127,6 +134,12 @@ class CarLifeService : Service() {
 
         fun stop(context: Context) {
             send(context, ACTION_STOP, foreground = false)
+        }
+
+        fun useUsb(context: Context, accessory: android.hardware.usb.UsbAccessory) {
+            val intent = Intent(context, CarLifeService::class.java).setAction(ACTION_USB).putExtra(android.hardware.usb.UsbManager.EXTRA_ACCESSORY, accessory)
+            runCatching { context.startForegroundService(intent) }
+                .onFailure { DiagLog.w("CarLife", "Android would not let FT start for the car's USB (${it.javaClass.simpleName}), open FT to connect") }
         }
 
         private fun send(context: Context, action: String, foreground: Boolean) {
@@ -188,6 +201,11 @@ class CarLifeService : Service() {
     private val mirror = PhoneMirror()
     private var session: CarLifeSession? = null
     private var wifiLink: WifiChannelLink? = null
+    private var usbLink: AccessoryLink? = null
+    @Volatile private var usbAccessory: android.hardware.usb.UsbAccessory? = null
+    private var usbAsk: android.content.BroadcastReceiver? = null
+    private var testCable: Job? = null
+    @Volatile private var testCableServer: java.net.ServerSocket? = null
     private var finder: CarFinder? = null
     private var stateJob: Job? = null
     private var mirrorJob: Job? = null
@@ -424,6 +442,7 @@ class CarLifeService : Service() {
         watchHeat()
         MirrorSink.onGone = { surface -> if (mirror.isShowing(surface)) mirror.hide() }
         watchCarBluetoothAudio()
+        watchUsb()
         progressJob = scope.launch {
             CarPlayer.state.collect { st -> songPosition(st) }
         }
@@ -469,27 +488,177 @@ class CarLifeService : Service() {
                 _state.update { it.copy(waitingForShare = false, shareForSound = false, mirrorPackage = "") }
                 DiagLog.i(tag, "screen sharing was declined on the phone")
             }
+            ACTION_USB -> {
+                val acc: android.hardware.usb.UsbAccessory? = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(android.hardware.usb.UsbManager.EXTRA_ACCESSORY, android.hardware.usb.UsbAccessory::class.java)
+                    else @Suppress("DEPRECATION") intent.getParcelableExtra(android.hardware.usb.UsbManager.EXTRA_ACCESSORY)
+                if (acc != null) {
+                    logEnvironment()
+                    useUsb(acc)
+                } else {
+                    DiagLog.w(tag, "USB: Android did not pass on the car's accessory")
+                    foreground(noteText)
+                    if (mode == -1) startChosenWay()
+                }
+            }
             ACTION_AUTO, ACTION_WIFI -> {
-                scope.launch { RootPrep.grants(this@CarLifeService) }
-                val wanted = if (app.prefs.linkMode == 1) 1 else 0
-                if (mode != -1 && mode != wanted) {
-                    DiagLog.i(tag, "switching to ${if (wanted == 1) "WiFi + BL" else "Hotspot"}, the other way is closed")
-                    stopLink()
-                }
-                val fresh = mode != wanted || wifiLink == null
-                mode = wanted
-                foreground(if (fresh) waitingText() else noteText)
-                _state.update { it.copy(direct = wanted == 1) }
-                startWifiLink()
-                if (fresh) {
-                    if (wanted == 1) startDirect() else startHotspot()
-                }
+                logEnvironment()
+                startChosenWay()
             }
         }
         return START_STICKY
     }
 
-    private fun waitingText() = if (mode == 1) "Waiting for the car over bluetooth" else "Waiting for the car on the hotspot"
+    private fun logEnvironment() {
+        scope.launch {
+            RootPrep.grants(this@CarLifeService)
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (envLoggedAt < 0 || now - envLoggedAt > 60_000) {
+                envLoggedAt = now
+                DiagLog.i("Env", "connecting via ${wayName(if (mode == 2) 2 else app.prefs.linkMode)}, what FT sees on this phone:")
+                DiagSnapshot.connectionStart(this@CarLifeService).forEach { DiagLog.i("Env", it) }
+            }
+        }
+    }
+
+    private fun wayName(way: Int) = when (way) {
+        1 -> "WiFi + BL"
+        2 -> "USB"
+        else -> "Hotspot"
+    }
+
+    private fun startChosenWay() {
+        listenForTestCable()
+        if (mode == 2 && usbLink != null) {
+            foreground(noteText)
+            DiagLog.i(tag, "the car is on the USB cable, staying on it")
+            return
+        }
+        if (cableFirst()) return
+        val wanted = when (app.prefs.linkMode) {
+            1 -> 1
+            2 -> 2
+            else -> 0
+        }
+        if (mode != -1 && mode != wanted) {
+            DiagLog.i(tag, "switching to ${wayName(wanted)}, the other way is closed")
+            stopLink()
+        }
+        if (wanted == 2) {
+            mode = 2
+            foreground(waitingText())
+            _state.update { it.copy(direct = false, usb = true) }
+            step("Plug the phone into the car's USB and open CarLife on the car")
+            return
+        }
+        val fresh = mode != wanted || wifiLink == null
+        mode = wanted
+        foreground(if (fresh) waitingText() else noteText)
+        _state.update { it.copy(direct = wanted == 1, usb = false) }
+        startWifiLink()
+        if (fresh) {
+            if (wanted == 1) startDirect() else startHotspot()
+        }
+    }
+
+    private fun cableCarLife(): android.hardware.usb.UsbAccessory? {
+        val um = getSystemService(Context.USB_SERVICE) as? android.hardware.usb.UsbManager ?: return null
+        return runCatching { um.accessoryList?.firstOrNull { UsbCar.isCarLife(it) } }.getOrNull()
+    }
+
+    private fun cableFirst(): Boolean {
+        if (android.os.SystemClock.elapsedRealtime() < usbQuietUntil) return false
+        val acc = cableCarLife() ?: return false
+        val um = getSystemService(Context.USB_SERVICE) as android.hardware.usb.UsbManager
+        if (um.hasPermission(acc)) {
+            useUsb(acc)
+            return true
+        }
+        askForCable(um, acc)
+        return false
+    }
+
+    private fun askForCable(um: android.hardware.usb.UsbManager, acc: android.hardware.usb.UsbAccessory) {
+        if (usbAsk == null) {
+            val r = object : android.content.BroadcastReceiver() {
+                override fun onReceive(c: Context, i: Intent) {
+                    val granted = i.getBooleanExtra(android.hardware.usb.UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    val a = cableCarLife()
+                    DiagLog.i(tag, "USB: the phone ${if (granted) "allowed" else "did not allow"} FT to use the car's cable")
+                    if (granted && a != null && app.prefs.autoConnect) useUsb(a)
+                }
+            }
+            runCatching {
+                val f = android.content.IntentFilter(USB_PERMISSION)
+                if (Build.VERSION.SDK_INT >= 33) registerReceiver(r, f, Context.RECEIVER_NOT_EXPORTED) else registerReceiver(r, f)
+                usbAsk = r
+            }.onFailure { DiagLog.w(tag, "USB: cannot listen for the cable permission: ${it.message}") }
+        }
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0)
+        val pi = PendingIntent.getBroadcast(this, 7, Intent(USB_PERMISSION).setPackage(packageName), flags)
+        DiagLog.i(tag, "USB: the car's CarLife is on the cable, asking the phone to let FT use it")
+        runCatching { um.requestPermission(acc, pi) }.onFailure { DiagLog.w(tag, "USB: could not ask for the cable: ${it.message}") }
+    }
+
+    private fun useUsb(acc: android.hardware.usb.UsbAccessory) {
+        if (mode == 2 && usbLink != null) DiagLog.i(tag, "USB: the car attached again, starting the cable link over")
+        DiagLog.i(tag, "USB: the car opened CarLife over the cable (${UsbCar.describe(acc)}), using the cable")
+        val um = getSystemService(Context.USB_SERVICE) as android.hardware.usb.UsbManager
+        startCable(acc, "the car's ${acc.model ?: "CarLife"} over the cable") {
+            val pfd = um.openAccessory(acc) ?: return@startCable null
+            AccessoryLink.Pipe(java.io.FileInputStream(pfd.fileDescriptor), java.io.FileOutputStream(pfd.fileDescriptor)) { pfd.close() }
+        }
+    }
+
+    private fun startCable(acc: android.hardware.usb.UsbAccessory?, what: String, open: () -> AccessoryLink.Pipe?) {
+        if (mode != -1) stopLink()
+        mode = 2
+        usbAccessory = acc
+        usbStartedAt = android.os.SystemClock.elapsedRealtime()
+        foreground("Connected to the car over USB")
+        _state.update { it.copy(direct = false, usb = true, listening = true) }
+        val l = AccessoryLink("USB", what, open)
+        usbLink = l
+        attachSession(l)
+    }
+
+    private fun listenForTestCable() {
+        if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE == 0 || testCable != null) return
+        testCable = scope.launch {
+            val ss = runCatching { NetUtil.listen(TEST_CABLE_PORT) { true } }.getOrNull() ?: return@launch
+            testCableServer = ss
+            DiagLog.i(tag, "USB test cable listening on $TEST_CABLE_PORT")
+            try {
+                while (true) {
+                    val s = ss.accept()
+                    runCatching { s.tcpNoDelay = true }
+                    launch(Dispatchers.Main) {
+                        DiagLog.i(tag, "USB: a car came in on the test cable")
+                        startCable(null, "the test cable") { AccessoryLink.Pipe(s.getInputStream(), s.getOutputStream()) { s.close() } }
+                    }
+                }
+            } catch (t: Throwable) {
+                DiagLog.d(tag, "USB test cable stopped: ${t.message}")
+            } finally {
+                runCatching { ss.close() }
+            }
+        }
+    }
+
+    private fun usbGone(why: String) {
+        if (mode != 2 || usbLink == null) return
+        DiagLog.i(tag, "USB: the cable link ended ($why)")
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - usbStartedAt < USB_QUICK_END_MS) usbQuietUntil = now + USB_QUIET_MS
+        stopLink()
+        mode = -1
+        if (app.prefs.autoConnect) startChosenWay()
+    }
+
+    private fun waitingText() = when (mode) {
+        1 -> "Waiting for the car over bluetooth"
+        2 -> "Waiting for the car on USB"
+        else -> "Waiting for the car on the hotspot"
+    }
 
     private fun foreground(text: String, projection: Boolean = false, microphone: Boolean = false) {
         noteText = text
@@ -527,7 +696,7 @@ class CarLifeService : Service() {
     }
 
     private fun awake() {
-        holdWifiSteady()
+        if (mode == 2) releaseWifi() else holdWifiSteady()
         if (wakeLock?.isHeld == true) return
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "FT:carlife").apply {
@@ -592,10 +761,17 @@ class CarLifeService : Service() {
 
     private fun watchWifiDirect() {
         p2pWatch?.cancel()
+        directStartedAt = android.os.SystemClock.elapsedRealtime()
+        blockerNote = ""
+        lastOtherWifi = -1
+        hotspotStoppedForDirect = false
         p2pWatch = scope.launch {
+            var ticks = 0
             while (mode == 1) {
                 delay(2000)
                 if (wifiLink?.connected == true) continue
+                if (ticks++ % 5 == 0) checkDirectBlockers()
+                askCarAgain()
                 val ip = NetUtil.wifiDirectIpv4(p2pIface)
                 val up = _state.value.wifiDirect
                 if (ip != null && !up) {
@@ -612,6 +788,48 @@ class CarLifeService : Service() {
                 }
             }
         }
+    }
+
+    private fun checkDirectBlockers() {
+        if (mode != 1 || wifiLink?.connected == true) return
+        val waited = android.os.SystemClock.elapsedRealtime() - directStartedAt
+        val hotspot = NetUtil.hotspotIpv4() != null
+        val other = DiagSnapshot.otherWifiMhz(this)
+        val called = _state.value.btCar != null || _state.value.carWifi != null
+        if ((other ?: 0) != lastOtherWifi) {
+            lastOtherWifi = other ?: 0
+            DiagLog.i(tag, if (other != null) "WiFi + BL: the phone is connected to another Wi-Fi on ${DiagSnapshot.band(other)} (${other} MHz); many phones can only join the car's WiFi Direct on that same channel" else "WiFi + BL: the phone is not connected to any other Wi-Fi")
+        }
+        if (hotspot && Root.granted && !hotspotStoppedForDirect) {
+            hotspotStoppedForDirect = true
+            DiagLog.i(tag, "WiFi + BL: the phone's hotspot is on and blocks WiFi Direct, turning it off with root")
+            Root.stopHotspot()
+        }
+        val busy = finder?.busyStreak ?: 0
+        val note = when {
+            hotspot -> "Turn off the phone's hotspot, it blocks WiFi Direct"
+            busy >= 3 -> "The phone won't search for the car: turn off its hotspot and any screen casting"
+            !called && waited > 25_000 -> "Open CarLife on the car's screen so the car calls the phone"
+            other != null && called && waited > 30_000 -> "Disconnect the phone from other Wi-Fi so it can join the car"
+            else -> ""
+        }
+        if (note == blockerNote) return
+        blockerNote = note
+        if (note.isEmpty()) return
+        DiagLog.w(tag, "WiFi + BL: $note (hotspot=$hotspot, search refused=$busy, other wifi=${other?.let { DiagSnapshot.band(it) } ?: "none"}, car called=$called, waited ${waited / 1000}s)")
+        step(note)
+    }
+
+    private fun askCarAgain() {
+        val name = _state.value.carWifi ?: return
+        if (mode != 1 || !bt.open || _state.value.wifiDirect || wifiLink?.connected == true) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        val inSight = finder?.inSight(name) == true
+        if (inSight || carSeenAt == 0L) carSeenAt = now
+        if (!JoinWatch.askCarAgain(now - carSeenAt, inSight)) return
+        DiagLog.i(tag, "WiFi + BL: the car's WiFi Direct '$name' has not shown up for ${(now - carSeenAt) / 1000}s, asking the car for it again over bluetooth")
+        carSeenAt = now
+        wireless.askName()
     }
 
     private fun stopLink() {
@@ -636,13 +854,16 @@ class CarLifeService : Service() {
         stateJob = null
         wifiLink?.stop()
         wifiLink = null
+        usbLink?.stop()
+        usbLink = null
+        usbAccessory = null
         pendingLaunch = null
         carDisplay.stop()
         _state.update {
             it.copy(
                 link = "", session = CarLifeSession.State.Idle, listening = false, aaOverlay = false,
                 mirroring = false, mirrorPackage = "", btCar = null, carWifi = null, wifiDirect = false,
-                beacon = false, step = "", refused = "", waitingForShare = false
+                beacon = false, step = "", refused = "", waitingForShare = false, usb = false
             )
         }
     }
@@ -759,7 +980,7 @@ class CarLifeService : Service() {
     private fun attachSession(l: CarLifeLink) {
         session?.stop()
         val s = CarLifeSession(this, l, app.prefs, scope)
-        s.hotspot = mode == 0
+        s.fullRateStart = mode != 1
         session = s
         s.onVideoConfig = { plan -> onVideoConfig(plan) }
         s.onFrameRate = { fps -> carDisplay.setFrameRate(VideoPlans.withinCap(fps, thermalCap)) }
@@ -785,6 +1006,7 @@ class CarLifeService : Service() {
             soundDeclined = false
             blockedSoundNoticed = false
             updateBeacon()
+            if (l === usbLink) scope.launch(Dispatchers.Main) { if (l === usbLink) usbGone(reason) }
         }
         stateJob?.cancel()
         stateJob = scope.launch {
@@ -910,11 +1132,19 @@ class CarLifeService : Service() {
     private fun triggerAaWireless() {
         val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager)?.adapter
         val bonded = runCatching { adapter?.bondedDevices?.toList() }.getOrNull().orEmpty()
+        val wantAddress = app.prefs.carBtAddress.trim()
         val want = app.prefs.carBtName.trim()
-        val device = bonded.firstOrNull { d ->
-            want.isNotEmpty() && runCatching { d.name }.getOrNull()?.contains(want, true) == true
-        } ?: bonded.firstOrNull { d -> runCatching { d.name }.getOrNull()?.contains("corolla", true) == true }
-        ?: bonded.firstOrNull()
+        val byAddress = bonded.firstOrNull { d -> wantAddress.isNotEmpty() && d.address.equals(wantAddress, true) }
+        val byName = bonded.firstOrNull { d -> want.isNotEmpty() && runCatching { d.name }.getOrNull()?.contains(want, true) == true }
+        val byClass = bonded.filter { d -> runCatching { d.bluetoothClass?.deviceClass }.getOrNull() == android.bluetooth.BluetoothClass.Device.AUDIO_VIDEO_CAR_AUDIO }
+        val device = byAddress ?: byName ?: byClass.singleOrNull()
+        DiagLog.i(tag, "car for Android Auto over bluetooth: " + when {
+            byAddress != null -> "the car that called FT (${byAddress.address})"
+            byName != null -> "the paired device named like '$want'"
+            byClass.size == 1 -> "the only paired device that says it is a car"
+            byClass.size > 1 -> "none, ${byClass.size} paired devices say they are cars and FT does not know which one"
+            else -> "none, no paired device says it is a car and FT has not heard from one yet"
+        } + " (paired: ${bonded.joinToString { d -> "'${runCatching { d.name }.getOrNull() ?: "?"}' class ${runCatching { Integer.toHexString(d.bluetoothClass?.deviceClass ?: 0) }.getOrNull()}" }})")
         if (device == null) {
             DiagLog.w(tag, "no bonded bluetooth device to hand Android Auto")
             return
@@ -1157,6 +1387,7 @@ class CarLifeService : Service() {
 
     private fun onCarRaisedWifiDirect(name: String) {
         if (mode != 1) return
+        carSeenAt = android.os.SystemClock.elapsedRealtime()
         app.prefs.carP2pName = name
         _state.update { it.copy(carWifi = name) }
         if (wifiLink?.connected == true) {
@@ -1752,6 +1983,57 @@ class CarLifeService : Service() {
     }
 
     private var btWatch: android.content.BroadcastReceiver? = null
+    private var usbWatch: android.content.BroadcastReceiver? = null
+    @Volatile private var envLoggedAt = -1L
+    @Volatile private var directStartedAt = 0L
+    @Volatile private var blockerNote = ""
+    @Volatile private var lastOtherWifi = -1
+    @Volatile private var hotspotStoppedForDirect = false
+    @Volatile private var carSeenAt = 0L
+    @Volatile private var usbStartedAt = 0L
+    @Volatile private var usbQuietUntil = 0L
+    private var lastUsb = ""
+
+    private fun watchUsb() {
+        val r = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: Context, i: Intent) {
+                when (i.action) {
+                    "android.hardware.usb.action.USB_STATE" -> {
+                        val ex = i.extras
+                        val flags = ex?.keySet()?.sorted()?.filter { ex.getBoolean(it, false) }.orEmpty()
+                        val line = "connected=${ex?.getBoolean("connected") == true} configured=${ex?.getBoolean("configured") == true} on: ${flags.joinToString().ifBlank { "nothing" }}"
+                        if (line == lastUsb) return
+                        lastUsb = line
+                        DiagLog.i("USB", "usb $line")
+                    }
+                    android.hardware.usb.UsbManager.ACTION_USB_ACCESSORY_DETACHED -> {
+                        DiagLog.i("USB", "usb accessory detached: ${usbAccessory(i)}")
+                        if (mode == 2 && usbLink != null) usbGone("the cable was unplugged")
+                    }
+                    android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED, android.hardware.usb.UsbManager.ACTION_USB_DEVICE_DETACHED ->
+                        DiagLog.i("USB", "usb device ${if (i.action == android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED) "attached" else "detached"}")
+                }
+            }
+        }
+        val f = android.content.IntentFilter().apply {
+            addAction("android.hardware.usb.action.USB_STATE")
+            addAction(android.hardware.usb.UsbManager.ACTION_USB_ACCESSORY_DETACHED)
+            addAction(android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(android.hardware.usb.UsbManager.ACTION_USB_DEVICE_DETACHED)
+        }
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(r, f, Context.RECEIVER_EXPORTED) else registerReceiver(r, f)
+            usbWatch = r
+        }.onFailure { DiagLog.w(tag, "cannot watch usb: ${it.message}") }
+        val um = getSystemService(Context.USB_SERVICE) as? android.hardware.usb.UsbManager
+        runCatching { um?.accessoryList?.forEach { a -> DiagLog.i("USB", "usb accessory present: ${a.manufacturer} ${a.model} ${a.version} ${a.description}") } }
+    }
+
+    private fun usbAccessory(i: Intent): String {
+        val a: android.hardware.usb.UsbAccessory? = if (Build.VERSION.SDK_INT >= 33) i.getParcelableExtra(android.hardware.usb.UsbManager.EXTRA_ACCESSORY, android.hardware.usb.UsbAccessory::class.java)
+            else @Suppress("DEPRECATION") i.getParcelableExtra(android.hardware.usb.UsbManager.EXTRA_ACCESSORY)
+        return a?.let { "${it.manufacturer} ${it.model} ${it.version} ${it.description}" } ?: "unknown"
+    }
 
     @SuppressLint("MissingPermission")
     private fun watchCarBluetoothAudio() {
@@ -1811,6 +2093,14 @@ class CarLifeService : Service() {
         teardown()
         btWatch?.let { runCatching { unregisterReceiver(it) } }
         btWatch = null
+        usbWatch?.let { runCatching { unregisterReceiver(it) } }
+        usbWatch = null
+        usbAsk?.let { runCatching { unregisterReceiver(it) } }
+        usbAsk = null
+        testCableServer?.let { runCatching { it.close() } }
+        testCableServer = null
+        testCable?.cancel()
+        testCable = null
         progressJob?.cancel()
         CarPlayer.onTrack = null
         CarPlayer.onBreak = null
