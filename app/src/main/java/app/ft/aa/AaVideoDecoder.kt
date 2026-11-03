@@ -231,10 +231,11 @@ class AaVideoDecoder(private val width: Int, private val height: Int) {
             if (codec !== dead || generation != mine) return
             running.set(false)
             codec = null
+            nextStartAttemptAt = SystemClock.elapsedRealtime() + START_RETRY_DELAY_MS
             if (drain === Thread.currentThread()) drain = null
             runCatching { dead.stop() }
             runCatching { dead.release() }
-            DiagLog.w(tag, "the decoder stopped, FT will start a fresh one with the next picture")
+            DiagLog.w(tag, "the decoder stopped; FT will retry after ${START_RETRY_DELAY_MS}ms")
         }
     }
 
