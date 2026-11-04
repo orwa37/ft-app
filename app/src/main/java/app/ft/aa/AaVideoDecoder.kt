@@ -10,12 +10,16 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 object AaVideoSink {
     private val _surface = MutableStateFlow<Surface?>(null)
     val surface: StateFlow<Surface?> = _surface
     private val _frame = MutableStateFlow<Pair<Int, Int>?>(null)
     val frame: StateFlow<Pair<Int, Int>?> = _frame
+    private val textureUpdates = AtomicLong(0L)
+    @Volatile var lastTextureUpdateAtMs = 0L
+        private set
     var width = 0
     var height = 0
 
@@ -32,6 +36,13 @@ object AaVideoSink {
     fun frameSize(width: Int, height: Int) {
         _frame.value = width to height
     }
+
+    fun textureUpdated() {
+        textureUpdates.incrementAndGet()
+        lastTextureUpdateAtMs = SystemClock.elapsedRealtime()
+    }
+
+    fun textureUpdateCount(): Long = textureUpdates.get()
 }
 
 class AaVideoDecoder(private val width: Int, private val height: Int) {
@@ -49,9 +60,12 @@ class AaVideoDecoder(private val width: Int, private val height: Int) {
     @Volatile private var missed = 0
     private var nextStartAttemptAt = 0L
     private var startFailures = 0
-    private var queuedInputs = 0L
-    private var inputStarved = 0L
-    private var renderedOutputs = 0L
+    private val queuedInputs = AtomicLong(0L)
+    private val inputStarved = AtomicLong(0L)
+    private val renderedOutputs = AtomicLong(0L)
+    private val emptyOutputPolls = AtomicLong(0L)
+    @Volatile private var lastInputAtMs = 0L
+    @Volatile private var lastOutputAtMs = 0L
     @Volatile var askForAFreshPicture: (() -> Unit)? = null
 
     init {
@@ -65,8 +79,11 @@ class AaVideoDecoder(private val width: Int, private val height: Int) {
             if (s === surface) return
             val had = surface != null
             surface = s
-            if (s != null) DiagLog.i(tag, "Android Auto's picture is drawn on the car screen")
-            else if (had) DiagLog.i(tag, "Android Auto's picture has nowhere to be drawn")
+            if (s != null) {
+                DiagLog.i(tag, "car screen surface attached valid=${s.isValid} id=${System.identityHashCode(s)}")
+            } else if (had) {
+                DiagLog.i(tag, "Android Auto's picture has nowhere to be drawn")
+            }
             if (s == null) {
                 stopLocked()
                 return
@@ -150,10 +167,12 @@ class AaVideoDecoder(private val width: Int, private val height: Int) {
             codec = c
             made = null
             AaVideoSink.frameSize(width, height)
+            lastInputAtMs = SystemClock.elapsedRealtime()
+            lastOutputAtMs = 0L
             drain = Thread({ drainLoop(c, mine) }, "FT-AaDrain-$mine").also { it.start() }
             startFailures = 0
             nextStartAttemptAt = 0L
-            DiagLog.i(tag, "decoder started ${width}x$height on ${runCatching { c.name }.getOrNull()}")
+            DiagLog.i(tag, "decoder started ${width}x$height on ${runCatching { c.name }.getOrNull()} generation=$mine surface=${System.identityHashCode(s)}")
             if (missed > 0) {
                 DiagLog.i(tag, "the car screen was not ready for $missed of Android Auto's pictures, asking it for a fresh one")
                 missed = 0
@@ -174,9 +193,10 @@ class AaVideoDecoder(private val width: Int, private val height: Int) {
         var slot = -1
         var given = false
         try {
-            slot = c.dequeueInputBuffer(20_000)
+            // Keep the AA reader responsive; the drain thread must be free to release output buffers.
+            slot = c.dequeueInputBuffer(INPUT_TIMEOUT_US)
             if (slot < 0) {
-                inputStarved++
+                inputStarved.incrementAndGet()
                 return
             }
             val buf = c.getInputBuffer(slot)
@@ -191,9 +211,10 @@ class AaVideoDecoder(private val width: Int, private val height: Int) {
             c.queueInputBuffer(slot, 0, data.size, ptsUs, if (isConfig) MediaCodec.BUFFER_FLAG_CODEC_CONFIG else 0)
             given = true
             if (!isConfig) {
-                queuedInputs++
-                if (queuedInputs % 300L == 0L) {
-                    DiagLog.i(tag, "decoder flow: input=$queuedInputs output=$renderedOutputs inputStarved=$inputStarved")
+                val count = queuedInputs.incrementAndGet()
+                lastInputAtMs = SystemClock.elapsedRealtime()
+                if (count % 300L == 0L) {
+                    DiagLog.i(tag, "decoder input checkpoint: queued=$count output=${renderedOutputs.get()} inputStarved=${inputStarved.get()}")
                 }
             }
         } catch (t: Throwable) {
@@ -204,26 +225,56 @@ class AaVideoDecoder(private val width: Int, private val height: Int) {
 
     private fun drainLoop(c: MediaCodec, mine: Long) {
         val info = MediaCodec.BufferInfo()
+        var lastStatsAt = SystemClock.elapsedRealtime()
         while (running.get() && generation == mine) {
             try {
                 val idx = c.dequeueOutputBuffer(info, 20_000)
-                synchronized(lock) {
-                    if (!running.get() || generation != mine || codec !== c) return
-                    if (idx >= 0) {
-                        c.releaseOutputBuffer(idx, true)
-                        renderedOutputs++
-                        _frames.value = _frames.value + 1
-                    } else if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                        shown(c.outputFormat)
+                if (idx >= 0) {
+                    val current = synchronized(lock) { running.get() && generation == mine && codec === c }
+                    if (!current) {
+                        runCatching { c.releaseOutputBuffer(idx, false) }
+                        return
                     }
+                    // Do not hold the decoder lock while releasing to Surface: input queuing must not
+                    // block the output thread, otherwise the codec can run out of output buffers.
+                    c.releaseOutputBuffer(idx, true)
+                    renderedOutputs.incrementAndGet()
+                    lastOutputAtMs = SystemClock.elapsedRealtime()
+                    _frames.value = _frames.value + 1
+                } else if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    val current = synchronized(lock) { running.get() && generation == mine && codec === c }
+                    if (current) shown(c.outputFormat)
+                } else if (idx == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                    emptyOutputPolls.incrementAndGet()
+                }
+
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastStatsAt >= DIAGNOSTIC_INTERVAL_MS) {
+                    logFlowStats(c, mine, now)
+                    lastStatsAt = now
                 }
             } catch (t: Throwable) {
                 if (!running.get() || generation != mine) return
-                DiagLog.e(tag, "drain failed", t)
+                DiagLog.e(tag, "drain failed generation=$mine", t)
                 gaveUp(c, mine)
                 return
             }
         }
+    }
+
+    private fun logFlowStats(c: MediaCodec, mine: Long, now: Long) {
+        val lastTexture = AaVideoSink.lastTextureUpdateAtMs
+        val textureAge = if (lastTexture == 0L) -1L else now - lastTexture
+        val inputAge = if (lastInputAtMs == 0L) -1L else now - lastInputAtMs
+        val outputAge = if (lastOutputAtMs == 0L) -1L else now - lastOutputAtMs
+        DiagLog.i(
+            tag,
+            "video flow gen=$mine codec=${runCatching { c.name }.getOrNull()} " +
+                "in=${queuedInputs.get()} out=${renderedOutputs.get()} starved=${inputStarved.get()} " +
+                "emptyPolls=${emptyOutputPolls.get()} surfaceValid=${surface?.isValid == true} " +
+                "textureUpdates=${AaVideoSink.textureUpdateCount()} textureAgeMs=$textureAge " +
+                "inputAgeMs=$inputAge outputAgeMs=$outputAge"
+        )
     }
 
     private fun gaveUp(dead: MediaCodec, mine: Long) {
@@ -243,7 +294,7 @@ class AaVideoDecoder(private val width: Int, private val height: Int) {
         val w = if (f.containsKey("crop-right") && f.containsKey("crop-left")) f.getInteger("crop-right") - f.getInteger("crop-left") + 1 else f.getInteger(MediaFormat.KEY_WIDTH)
         val h = if (f.containsKey("crop-bottom") && f.containsKey("crop-top")) f.getInteger("crop-bottom") - f.getInteger("crop-top") + 1 else f.getInteger(MediaFormat.KEY_HEIGHT)
         if (w <= 0 || h <= 0) return
-        DiagLog.i(tag, "Android Auto draws ${w}x$h" + if (w != width || h != height) ", not the ${width}x$height FT asked for" else "")
+        DiagLog.i(tag, "Android Auto decoder output format=${w}x$h, requested=${width}x$height")
         AaVideoSink.frameSize(w, h)
     }
 
@@ -271,6 +322,8 @@ class AaVideoDecoder(private val width: Int, private val height: Int) {
 
     companion object {
         private const val START_RETRY_DELAY_MS = 750L
+        private const val INPUT_TIMEOUT_US = 5_000L
+        private const val DIAGNOSTIC_INTERVAL_MS = 5_000L
 
         val mediaTek: Boolean by lazy {
             val hardware = Build.HARDWARE.orEmpty().lowercase()
