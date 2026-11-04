@@ -46,5 +46,7 @@ class AaVideoView(context: Context) : TextureView(context), TextureView.SurfaceT
         return true
     }
 
-    override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
+    override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {
+        AaVideoSink.textureUpdated()
+    }
 }
