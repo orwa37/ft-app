@@ -61,6 +61,8 @@ class AaSession(
     private val videoPackets = AtomicLong(0L)
     private val videoPayloadBytes = AtomicLong(0L)
     private val videoMalformedPackets = AtomicLong(0L)
+    private val videoRecoveryRequests = AtomicLong(0L)
+    @Volatile private var lastVideoRecoveryRequestAtMs = 0L
     @Volatile private var lastVideoPacketAtMs = 0L
     @Volatile private var lastVideoPacketBytes = 0
     private val _phase = MutableStateFlow(Phase.CONNECTED)
@@ -231,7 +233,14 @@ class AaSession(
         if (id == AaProtocol.AV_MEDIA_INDICATION || id == AaProtocol.AV_MEDIA_WITH_TIMESTAMP) {
             videoPackets.incrementAndGet()
             videoPayloadBytes.addAndGet(body.size.toLong())
-            lastVideoPacketAtMs = android.os.SystemClock.elapsedRealtime()
+            val packetNow = android.os.SystemClock.elapsedRealtime()
+            val previousPacketAt = lastVideoPacketAtMs
+            if (previousPacketAt != 0L && packetNow - previousPacketAt >= VIDEO_STALL_TIMEOUT_MS) {
+                videoRecoveryRequests.set(0L)
+                lastVideoRecoveryRequestAtMs = 0L
+                DiagLog.i(tag, "video packets resumed after ${packetNow - previousPacketAt}ms")
+            }
+            lastVideoPacketAtMs = packetNow
             lastVideoPacketBytes = body.size
             if (id == AaProtocol.AV_MEDIA_WITH_TIMESTAMP && body.size <= 8) videoMalformedPackets.incrementAndGet()
         }
@@ -248,6 +257,8 @@ class AaSession(
                 videoPackets.set(0L)
                 videoPayloadBytes.set(0L)
                 videoMalformedPackets.set(0L)
+                videoRecoveryRequests.set(0L)
+                lastVideoRecoveryRequestAtMs = 0L
                 lastVideoPacketAtMs = 0L
                 lastVideoPacketBytes = 0
                 videoMonitor?.cancel()
@@ -256,8 +267,16 @@ class AaSession(
                 videoMonitor = scope.launch {
                     while (isActive && _phase.value == Phase.STREAMING && videoSession == monitoredSession) {
                         delay(5_000)
-                        val age = if (lastVideoPacketAtMs == 0L) -1L else android.os.SystemClock.elapsedRealtime() - lastVideoPacketAtMs
-                        DiagLog.i(tag, "video ingress session=" + monitoredSession + " packets=" + videoPackets.get() + " payloadBytes=" + videoPayloadBytes.get() + " framesParsed=" + mediaFrames + " malformed=" + videoMalformedPackets.get() + " lastPacketAgeMs=" + age + " lastPacketBytes=" + lastVideoPacketBytes + " decoderRendered=" + decoder.frames.value)
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        val age = if (lastVideoPacketAtMs == 0L) -1L else now - lastVideoPacketAtMs
+                        val packetCount = videoPackets.get()
+                        if (packetCount > 0L && age >= VIDEO_STALL_TIMEOUT_MS && videoRecoveryRequests.get() < MAX_VIDEO_RECOVERY_REQUESTS && now - lastVideoRecoveryRequestAtMs >= VIDEO_RECOVERY_INTERVAL_MS) {
+                            val attempt = videoRecoveryRequests.incrementAndGet()
+                            lastVideoRecoveryRequestAtMs = now
+                            DiagLog.w(tag, "video stream stalled for ${age}ms; requesting a fresh picture (attempt $attempt/$MAX_VIDEO_RECOVERY_REQUESTS)")
+                            askForAFreshPicture()
+                        }
+                        DiagLog.i(tag, "video ingress session=" + monitoredSession + " packets=" + packetCount + " payloadBytes=" + videoPayloadBytes.get() + " framesParsed=" + mediaFrames + " malformed=" + videoMalformedPackets.get() + " lastPacketAgeMs=" + age + " lastPacketBytes=" + lastVideoPacketBytes + " recoveryRequests=" + videoRecoveryRequests.get() + " decoderRendered=" + decoder.frames.value)
                     }
                 }
                 decoder.askForAFreshPicture = { scope.launch { askForAFreshPicture() } }
@@ -368,6 +387,12 @@ class AaSession(
             mic.stop()
         }
         sendMicrophone(pcm)
+    }
+
+    companion object {
+        private const val VIDEO_STALL_TIMEOUT_MS = 5_000L
+        private const val VIDEO_RECOVERY_INTERVAL_MS = 10_000L
+        private const val MAX_VIDEO_RECOVERY_REQUESTS = 3L
     }
 
     private fun sendMicrophone(pcm: ByteArray) {
