@@ -12,6 +12,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import java.util.concurrent.atomic.AtomicLong
 import java.io.InputStream
 import java.io.OutputStream
 
@@ -55,6 +57,12 @@ class AaSession(
     private val audioSessions = HashMap<Int, Int>()
     private val audioMeasured = HashSet<Int>()
     private var mediaFrames = 0L
+    private var videoMonitor: Job? = null
+    private val videoPackets = AtomicLong(0L)
+    private val videoPayloadBytes = AtomicLong(0L)
+    private val videoMalformedPackets = AtomicLong(0L)
+    @Volatile private var lastVideoPacketAtMs = 0L
+    @Volatile private var lastVideoPacketBytes = 0
     private val _phase = MutableStateFlow(Phase.CONNECTED)
     val phase: StateFlow<Phase> = _phase
     @Volatile var hasStreamed = false
@@ -220,6 +228,13 @@ class AaSession(
     }
 
     private fun handleVideo(id: Int, body: ByteArray) {
+        if (id == AaProtocol.AV_MEDIA_INDICATION || id == AaProtocol.AV_MEDIA_WITH_TIMESTAMP) {
+            videoPackets.incrementAndGet()
+            videoPayloadBytes.addAndGet(body.size.toLong())
+            lastVideoPacketAtMs = android.os.SystemClock.elapsedRealtime()
+            lastVideoPacketBytes = body.size
+            if (id == AaProtocol.AV_MEDIA_WITH_TIMESTAMP && body.size <= 8) videoMalformedPackets.incrementAndGet()
+        }
         when (id) {
             AaProtocol.AV_SETUP_REQUEST -> {
                 DiagLog.i(tag, "video setup config=${AaMessages.setupConfigIndex(body)}")
@@ -230,6 +245,20 @@ class AaSession(
                 hasStreamed = true
                 videoSession = AaMessages.startSession(body)
                 mediaFrames = 0
+                videoPackets.set(0L)
+                videoPayloadBytes.set(0L)
+                videoMalformedPackets.set(0L)
+                lastVideoPacketAtMs = 0L
+                lastVideoPacketBytes = 0
+                videoMonitor?.cancel()
+                val monitoredSession = videoSession
+                videoMonitor = scope.launch {
+                    while (isActive && _phase.value == Phase.STREAMING && videoSession == monitoredSession) {
+                        delay(5_000)
+                        val age = if (lastVideoPacketAtMs == 0L) -1L else android.os.SystemClock.elapsedRealtime() - lastVideoPacketAtMs
+                        DiagLog.i(tag, "video ingress session=" + monitoredSession + " packets=" + videoPackets.get() + " payloadBytes=" + videoPayloadBytes.get() + " framesParsed=" + mediaFrames + " malformed=" + videoMalformedPackets.get() + " lastPacketAgeMs=" + age + " lastPacketBytes=" + lastVideoPacketBytes + " decoderRendered=" + decoder.frames.value)
+                    }
+                }
                 decoder.askForAFreshPicture = { scope.launch { askForAFreshPicture() } }
                 _phase.value = Phase.STREAMING
                 DiagLog.i(tag, "video start session=$videoSession")
@@ -237,6 +266,8 @@ class AaSession(
             }
             AaProtocol.AV_STOP_INDICATION -> {
                 DiagLog.i(tag, "video stop")
+                videoMonitor?.cancel()
+                videoMonitor = null
                 decoder.stop()
                 _phase.value = Phase.DISCOVERED
             }
