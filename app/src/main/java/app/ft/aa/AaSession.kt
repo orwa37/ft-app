@@ -56,7 +56,7 @@ class AaSession(
     private var videoSession = 0
     private val audioSessions = HashMap<Int, Int>()
     private val audioMeasured = HashSet<Int>()
-    private var mediaFrames = 0L
+    @Volatile private var mediaFrames = 0L
     private var videoMonitor: Job? = null
     private val videoPackets = AtomicLong(0L)
     private val videoPayloadBytes = AtomicLong(0L)
@@ -251,6 +251,7 @@ class AaSession(
                 lastVideoPacketAtMs = 0L
                 lastVideoPacketBytes = 0
                 videoMonitor?.cancel()
+                _phase.value = Phase.STREAMING
                 val monitoredSession = videoSession
                 videoMonitor = scope.launch {
                     while (isActive && _phase.value == Phase.STREAMING && videoSession == monitoredSession) {
@@ -260,7 +261,6 @@ class AaSession(
                     }
                 }
                 decoder.askForAFreshPicture = { scope.launch { askForAFreshPicture() } }
-                _phase.value = Phase.STREAMING
                 DiagLog.i(tag, "video start session=$videoSession")
                 sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, false))
             }
