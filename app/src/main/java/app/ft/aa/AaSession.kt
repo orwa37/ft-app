@@ -58,6 +58,11 @@ class AaSession(
     private val audioMeasured = HashSet<Int>()
     @Volatile private var mediaFrames = 0L
     private var videoMonitor: Job? = null
+    // Counts raw channel-3 frames before decryption/assembly/dispatch. This distinguishes
+    // a phone-side video stall from a framing, crypto, or message-assembly problem.
+    private val rawVideoFrames = AtomicLong(0L)
+    private val rawVideoBytes = AtomicLong(0L)
+    @Volatile private var lastRawVideoFrameAtMs = 0L
     private val videoPackets = AtomicLong(0L)
     private val videoPayloadBytes = AtomicLong(0L)
     private val videoMalformedPackets = AtomicLong(0L)
@@ -88,6 +93,14 @@ class AaSession(
                 DiagLog.i(tag, "version request sent")
                 while (isActive && lifecycle.running) {
                     val frame = AaFraming.readFrame(input)
+                    if (frame.channel == AaProtocol.CH_VIDEO) {
+                        val rawCount = rawVideoFrames.incrementAndGet()
+                        rawVideoBytes.addAndGet(frame.payload.size.toLong())
+                        lastRawVideoFrameAtMs = android.os.SystemClock.elapsedRealtime()
+                        if (rawCount <= 8L) {
+                            DiagLog.i(tag, "raw video socket frame #$rawCount flags=0x${Integer.toHexString(frame.flags)} bytes=${frame.payload.size} encrypted=${frame.encrypted} type=${frame.frameType}")
+                        }
+                    }
                     lifecycle.dispatch {
                         assembler.feed(frame)?.let { dispatch(it) }
                     }
@@ -254,6 +267,9 @@ class AaSession(
                 hasStreamed = true
                 videoSession = AaMessages.startSession(body)
                 mediaFrames = 0
+                rawVideoFrames.set(0L)
+                rawVideoBytes.set(0L)
+                lastRawVideoFrameAtMs = 0L
                 videoPackets.set(0L)
                 videoPayloadBytes.set(0L)
                 videoMalformedPackets.set(0L)
@@ -269,6 +285,8 @@ class AaSession(
                         delay(5_000)
                         val now = android.os.SystemClock.elapsedRealtime()
                         val age = if (lastVideoPacketAtMs == 0L) -1L else now - lastVideoPacketAtMs
+                        val rawAge = if (lastRawVideoFrameAtMs == 0L) -1L else now - lastRawVideoFrameAtMs
+                        val rawCount = rawVideoFrames.get()
                         val packetCount = videoPackets.get()
                         if (packetCount > 0L && age >= VIDEO_STALL_TIMEOUT_MS && videoRecoveryRequests.get() < MAX_VIDEO_RECOVERY_REQUESTS && now - lastVideoRecoveryRequestAtMs >= VIDEO_RECOVERY_INTERVAL_MS) {
                             val attempt = videoRecoveryRequests.incrementAndGet()
@@ -276,7 +294,7 @@ class AaSession(
                             DiagLog.w(tag, "video stream stalled for ${age}ms; requesting a fresh picture (attempt $attempt/$MAX_VIDEO_RECOVERY_REQUESTS)")
                             askForAFreshPicture()
                         }
-                        DiagLog.i(tag, "video ingress session=" + monitoredSession + " packets=" + packetCount + " payloadBytes=" + videoPayloadBytes.get() + " framesParsed=" + mediaFrames + " malformed=" + videoMalformedPackets.get() + " lastPacketAgeMs=" + age + " lastPacketBytes=" + lastVideoPacketBytes + " recoveryRequests=" + videoRecoveryRequests.get() + " decoderRendered=" + decoder.frames.value)
+                        DiagLog.i(tag, "video transport session=" + monitoredSession + " rawFrames=" + rawCount + " rawBytes=" + rawVideoBytes.get() + " rawAgeMs=" + rawAge + " dispatchedPackets=" + packetCount + " payloadBytes=" + videoPayloadBytes.get() + " framesParsed=" + mediaFrames + " malformed=" + videoMalformedPackets.get() + " lastPacketAgeMs=" + age + " lastPacketBytes=" + lastVideoPacketBytes + " recoveryRequests=" + videoRecoveryRequests.get() + " decoderRendered=" + decoder.frames.value)
                     }
                 }
                 decoder.askForAFreshPicture = { scope.launch { askForAFreshPicture() } }
