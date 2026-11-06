@@ -14,6 +14,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicLongArray
+import java.util.concurrent.atomic.AtomicIntegerArray
 import java.io.InputStream
 import java.io.OutputStream
 
@@ -61,6 +63,14 @@ class AaSession(
     // Counts raw channel-3 frames before decryption/assembly/dispatch. This distinguishes
     // a phone-side video stall from a framing, crypto, or message-assembly problem.
     private val rawVideoFrames = AtomicLong(0L)
+    private val rawFramesByChannel = AtomicLongArray(CHANNEL_COUNTERS)
+    private val rawBytesByChannel = AtomicLongArray(CHANNEL_COUNTERS)
+    private val dispatchedMessagesByChannel = AtomicLongArray(CHANNEL_COUNTERS)
+    private val lastDispatchedIdByChannel = AtomicIntegerArray(CHANNEL_COUNTERS)
+    private val lastDispatchedAtByChannel = AtomicLongArray(CHANNEL_COUNTERS)
+    private val totalRawFrames = AtomicLong(0L)
+    @Volatile private var lastAnyRawFrameAtMs = 0L
+    private val outboundVideoAcks = AtomicLong(0L)
     private val rawVideoBytes = AtomicLong(0L)
     @Volatile private var lastRawVideoFrameAtMs = 0L
     private val videoPackets = AtomicLong(0L)
@@ -93,6 +103,13 @@ class AaSession(
                 DiagLog.i(tag, "version request sent")
                 while (isActive && lifecycle.running) {
                     val frame = AaFraming.readFrame(input)
+                    val frameNow = android.os.SystemClock.elapsedRealtime()
+                    totalRawFrames.incrementAndGet()
+                    lastAnyRawFrameAtMs = frameNow
+                    if (frame.channel in 0 until CHANNEL_COUNTERS) {
+                        rawFramesByChannel.incrementAndGet(frame.channel)
+                        rawBytesByChannel.addAndGet(frame.channel, frame.payload.size.toLong())
+                    }
                     if (frame.channel == AaProtocol.CH_VIDEO) {
                         val rawCount = rawVideoFrames.incrementAndGet()
                         rawVideoBytes.addAndGet(frame.payload.size.toLong())
@@ -102,7 +119,14 @@ class AaSession(
                         }
                     }
                     lifecycle.dispatch {
-                        assembler.feed(frame)?.let { dispatch(it) }
+                        assembler.feed(frame)?.let { message ->
+                            if (message.channel in 0 until CHANNEL_COUNTERS) {
+                                dispatchedMessagesByChannel.incrementAndGet(message.channel)
+                                lastDispatchedIdByChannel.set(message.channel, message.id)
+                                lastDispatchedAtByChannel.set(message.channel, android.os.SystemClock.elapsedRealtime())
+                            }
+                            dispatch(message)
+                        }
                     }
                 }
             } catch (t: Throwable) {
@@ -134,6 +158,12 @@ class AaSession(
             if (!lifecycle.running) return
             try {
                 val frames = AaFraming.encode(channel, payload, encrypted, control) { if (encrypted) crypto.encrypt(it) else it }
+                if (channel == AaProtocol.CH_VIDEO && id == AaProtocol.AV_MEDIA_ACK) {
+                    val ackCount = outboundVideoAcks.incrementAndGet()
+                    if (ackCount <= 5L || ackCount % 100L == 0L) {
+                        DiagLog.d(tag, "video media ACK sent #$ackCount")
+                    }
+                }
                 frames.forEach { output.write(it) }
                 output.flush()
                 null
@@ -264,6 +294,7 @@ class AaSession(
                 sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, false))
             }
             AaProtocol.AV_START_INDICATION -> {
+                DiagLog.w(tag, "VIDEO EVENT: AV_START_INDICATION bodyBytes=${body.size}")
                 hasStreamed = true
                 videoSession = AaMessages.startSession(body)
                 mediaFrames = 0
@@ -288,13 +319,39 @@ class AaSession(
                         val rawAge = if (lastRawVideoFrameAtMs == 0L) -1L else now - lastRawVideoFrameAtMs
                         val rawCount = rawVideoFrames.get()
                         val packetCount = videoPackets.get()
+                        val anyRawAge = if (lastAnyRawFrameAtMs == 0L) -1L else now - lastAnyRawFrameAtMs
+                        val rawChannels = (0 until CHANNEL_COUNTERS).mapNotNull { ch ->
+                            val count = rawFramesByChannel.get(ch)
+                            if (count == 0L) null else "$ch:$count/${rawBytesByChannel.get(ch)}"
+                        }.joinToString(",")
+                        val dispatchedChannels = (0 until CHANNEL_COUNTERS).mapNotNull { ch ->
+                            val count = dispatchedMessagesByChannel.get(ch)
+                            if (count == 0L) null else "$ch:$count(last=0x${Integer.toHexString(lastDispatchedIdByChannel.get(ch))},age=${if (lastDispatchedAtByChannel.get(ch) == 0L) -1L else now - lastDispatchedAtByChannel.get(ch)}ms)"
+                        }.joinToString(",")
                         if (packetCount > 0L && age >= VIDEO_STALL_TIMEOUT_MS && videoRecoveryRequests.get() < MAX_VIDEO_RECOVERY_REQUESTS && now - lastVideoRecoveryRequestAtMs >= VIDEO_RECOVERY_INTERVAL_MS) {
                             val attempt = videoRecoveryRequests.incrementAndGet()
                             lastVideoRecoveryRequestAtMs = now
                             DiagLog.w(tag, "video stream stalled for ${age}ms; requesting a fresh picture (attempt $attempt/$MAX_VIDEO_RECOVERY_REQUESTS)")
                             askForAFreshPicture()
                         }
-                        DiagLog.i(tag, "video transport session=" + monitoredSession + " rawFrames=" + rawCount + " rawBytes=" + rawVideoBytes.get() + " rawAgeMs=" + rawAge + " dispatchedPackets=" + packetCount + " payloadBytes=" + videoPayloadBytes.get() + " framesParsed=" + mediaFrames + " malformed=" + videoMalformedPackets.get() + " lastPacketAgeMs=" + age + " lastPacketBytes=" + lastVideoPacketBytes + " recoveryRequests=" + videoRecoveryRequests.get() + " decoderRendered=" + decoder.frames.value)
+                        DiagLog.i(tag, "transport session=" + monitoredSession +
+                            " phase=" + _phase.value +
+                            " totalRawFrames=" + totalRawFrames.get() +
+                            " anyRawAgeMs=" + anyRawAge +
+                            " rawByChannel=[" + rawChannels + "]" +
+                            " dispatchedByChannel=[" + dispatchedChannels + "]" +
+                            " videoRawFrames=" + rawCount +
+                            " videoRawBytes=" + rawVideoBytes.get() +
+                            " videoRawAgeMs=" + rawAge +
+                            " videoPackets=" + packetCount +
+                            " videoPayloadBytes=" + videoPayloadBytes.get() +
+                            " videoFramesParsed=" + mediaFrames +
+                            " videoMalformed=" + videoMalformedPackets.get() +
+                            " videoLastPacketAgeMs=" + age +
+                            " videoLastPacketBytes=" + lastVideoPacketBytes +
+                            " videoRecoveryRequests=" + videoRecoveryRequests.get() +
+                            " videoAcksSent=" + outboundVideoAcks.get() +
+                            " decoderRendered=" + decoder.frames.value)
                     }
                 }
                 decoder.askForAFreshPicture = { scope.launch { askForAFreshPicture() } }
@@ -302,6 +359,7 @@ class AaSession(
                 sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, false))
             }
             AaProtocol.AV_STOP_INDICATION -> {
+                DiagLog.w(tag, "VIDEO EVENT: AV_STOP_INDICATION bodyBytes=${body.size}")
                 DiagLog.i(tag, "video stop")
                 videoMonitor?.cancel()
                 videoMonitor = null
@@ -411,6 +469,7 @@ class AaSession(
         private const val VIDEO_STALL_TIMEOUT_MS = 5_000L
         private const val VIDEO_RECOVERY_INTERVAL_MS = 10_000L
         private const val MAX_VIDEO_RECOVERY_REQUESTS = 3L
+        private const val CHANNEL_COUNTERS = 16
     }
 
     private fun sendMicrophone(pcm: ByteArray) {
