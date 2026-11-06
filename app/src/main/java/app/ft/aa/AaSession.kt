@@ -176,7 +176,15 @@ class AaSession(
         val failure = synchronized(outLock) {
             if (!lifecycle.running) return
             try {
-                val frames = AaFraming.encode(channel, payload, encrypted, control) { if (encrypted) crypto.encrypt(it) else it }
+                // GAL framing marks every channel-0 message as CONTROL (bit 2),
+                // including version/auth/SDP/ping/open responses. Service channels
+                // remain SPECIFIC unless a caller explicitly requests otherwise.
+                val messageIsControl = control || channel == AaProtocol.CH_CONTROL
+                val frames = AaFraming.encode(channel, payload, encrypted, messageIsControl) { if (encrypted) crypto.encrypt(it) else it }
+                if (channel == AaProtocol.CH_CONTROL && outboundFrames.get() < 40L) {
+                    val flags = frames.firstOrNull()?.getOrNull(1)?.toInt()?.and(0xff) ?: -1
+                    DiagLog.d(tag, "TX CONTROL ${AaProtocol.controlName(id)} encrypted=$encrypted flags=0x${Integer.toHexString(flags)} bytes=${body.size}")
+                }
                 if (channel == AaProtocol.CH_VIDEO && id == AaProtocol.AV_MEDIA_ACK) {
                     val ackCount = outboundVideoAcks.incrementAndGet()
                     if (ackCount <= 5L || ackCount % 100L == 0L) {
