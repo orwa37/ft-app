@@ -252,19 +252,19 @@ class AaSession(
                 _phase.value = Phase.DISCOVERED
             }
             AaProtocol.CHANNEL_OPEN_REQUEST -> {
-                // CHANNEL_OPEN_REQUEST is carried on control channel 0. Its protobuf body
-                // identifies the requested service (field 1) and the negotiated wire channel (field 2).
-                val serviceType = AaMessages.channelOpenServiceType(body)
+                // Android Auto may carry this control message on the service channel being opened.
+                // The request body is priority (field 1) + channel ID (field 2), not service_type.
+                val priority = AaMessages.channelOpenPriority(body)
                 val targetChannel = AaMessages.channelOpenChannelId(body)
                 if (targetChannel !in 1 until CHANNEL_COUNTERS) {
-                    DiagLog.e(tag, "invalid CHANNEL_OPEN_REQUEST service=$serviceType channel=$targetChannel bodyBytes=${body.size}")
+                    DiagLog.e(tag, "invalid CHANNEL_OPEN_REQUEST priority=$priority frameChannel=$channel channel=$targetChannel bodyBytes=${body.size}")
                     return
                 }
                 openChannels += targetChannel
-                DiagLog.i(tag, "channel open request service=$serviceType channel=$targetChannel (${AaProtocol.channelName(targetChannel)})")
-                // The acknowledgement itself belongs to the control channel, not the newly opened channel.
-                sendEnc(AaProtocol.CH_CONTROL, AaProtocol.CHANNEL_OPEN_RESPONSE, AaMessages.channelOpenResponse(), true)
-                if (serviceType == AaProtocol.SERVICE_NAVIGATION_STATUS) {
+                DiagLog.i(tag, "channel open request priority=$priority frameChannel=$channel targetChannel=$targetChannel (${AaProtocol.channelName(targetChannel)})")
+                // Acknowledge on the same channel that carried the open request.
+                sendEnc(channel, AaProtocol.CHANNEL_OPEN_RESPONSE, AaMessages.channelOpenResponse(), true)
+                if (targetChannel == AaProtocol.CH_NAVIGATION) {
                     sendEnc(targetChannel, AaProtocol.NAV_START, ByteArray(0))
                     DiagLog.i(tag, "navigation status started on channel=$targetChannel")
                 }
