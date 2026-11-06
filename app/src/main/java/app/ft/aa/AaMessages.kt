@@ -149,8 +149,9 @@ object AaMessages {
             .toByteArray()
 
     fun deviceName(b: ByteArray): String = ProtoReader(b).let { it.string(5) ?: it.string(4) ?: Build.MODEL }
-    // ChannelOpenRequest: field 1 = service_type, field 2 = negotiated channel_id.
-    fun channelOpenServiceType(b: ByteArray): Int = ProtoReader(b).int(1, -1)
+    // ChannelOpenRequest uses field 1 for priority and field 2 for the channel ID.
+    // Keep the field name explicit: it is not a service identifier.
+    fun channelOpenPriority(b: ByteArray): Int = ProtoReader(b).int(1, -1)
     fun channelOpenChannelId(b: ByteArray): Int = ProtoReader(b).int(2, -1)
     fun setupConfigIndex(b: ByteArray): Int = ProtoReader(b).int(1, 0)
     fun startSession(b: ByteArray): Int = ProtoReader(b).int(1, 0)
