@@ -262,8 +262,10 @@ class AaSession(
                 }
                 openChannels += targetChannel
                 DiagLog.i(tag, "channel open request priority=$priority frameChannel=$channel targetChannel=$targetChannel (${AaProtocol.channelName(targetChannel)})")
-                // Acknowledge on the same channel that carried the open request.
-                sendEnc(channel, AaProtocol.CHANNEL_OPEN_RESPONSE, AaMessages.channelOpenResponse(), true)
+                // CHANNEL_OPEN_RESPONSE is a control-plane acknowledgement. Keep it on
+                // channel 0 with the control flag, even when the request arrived on a
+                // service channel (some Android Auto builds deliver it that way).
+                sendEnc(AaProtocol.CH_CONTROL, AaProtocol.CHANNEL_OPEN_RESPONSE, AaMessages.channelOpenResponse(), true)
                 if (targetChannel == AaProtocol.CH_NAVIGATION) {
                     sendEnc(targetChannel, AaProtocol.NAV_START, ByteArray(0))
                     DiagLog.i(tag, "navigation status started on channel=$targetChannel")
