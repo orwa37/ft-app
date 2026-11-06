@@ -520,7 +520,7 @@ class AaSession(
                 val blockedFor = if (readStarted == 0L) -1L else now - readStarted
                 val sinceRx = if (readCompleted == 0L) -1L else now - readCompleted
                 val sinceTx = if (lastWriteAtMs.get() == 0L) -1L else now - lastWriteAtMs.get()
-                DiagLog.i(tag, "transport health phase=${_phase.value} readCalls=${readCalls.get()} readBlockedMs=$blockedFor sinceRxMs=$sinceRx sinceTxMs=$sinceTx outboundFrames=${outboundFrames.get()} pingResponses=${pingResponses.get()} missedPingRounds=${missedPingRounds.get()} openChannels=${openChannels.toList().sorted()}")
+                DiagLog.i(tag, "transport health phase=${_phase.value} readCalls=${readCalls.get()} readBlockedMs=$blockedFor sinceRxMs=$sinceRx sinceTxMs=$sinceTx outboundFrames=${outboundFrames.get()} pingResponses=${pingResponses.get()} missedPingRounds=${missedPingRounds.get()} openChannels=${synchronized(openChannels) { openChannels.toList().sorted() }}")
             }
         }
     }
