@@ -42,6 +42,9 @@ class AaSession(
             runCatching { input.close() }
             runCatching { output.close() }
             job?.cancel()
+            transportMonitorJob?.cancel()
+            keepaliveJob?.cancel()
+            videoMonitor?.cancel()
         },
         cleanup = { reason ->
             runCatching { mic.stop() }
@@ -60,6 +63,17 @@ class AaSession(
     private val audioMeasured = HashSet<Int>()
     @Volatile private var mediaFrames = 0L
     private var videoMonitor: Job? = null
+    private var transportMonitorJob: Job? = null
+    private var keepaliveJob: Job? = null
+    private val readCalls = AtomicLong(0L)
+    private val outboundFrames = AtomicLong(0L)
+    private val lastReadStartedAtMs = AtomicLong(0L)
+    private val lastReadCompletedAtMs = AtomicLong(0L)
+    private val lastWriteAtMs = AtomicLong(0L)
+    private val lastPingToken = AtomicLong(0L)
+    private val lastPingResponseToken = AtomicLong(0L)
+    private val pingResponses = AtomicLong(0L)
+    private val missedPingRounds = AtomicLong(0L)
     // Counts raw channel-3 frames before decryption/assembly/dispatch. This distinguishes
     // a phone-side video stall from a framing, crypto, or message-assembly problem.
     private val rawVideoFrames = AtomicLong(0L)
@@ -88,7 +102,7 @@ class AaSession(
         private set
     private val _deviceName = MutableStateFlow("")
     val deviceName: StateFlow<String> = _deviceName
-    private val openChannels = HashSet<Int>()
+    private val openChannels = java.util.Collections.synchronizedSet(HashSet<Int>())
     private val navigation = AaNavigation()
     private val mic = AaMicrophone { pcm -> sendMicrophone(pcm) }
     @Volatile private var micWanted = false
@@ -101,9 +115,13 @@ class AaSession(
             try {
                 sendPlain(AaProtocol.CH_CONTROL, AaProtocol.VERSION_REQUEST, AaMessages.versionRequest(), false)
                 DiagLog.i(tag, "version request sent")
+                startTransportMonitor()
                 while (isActive && lifecycle.running) {
+                    lastReadStartedAtMs.set(android.os.SystemClock.elapsedRealtime())
                     val frame = AaFraming.readFrame(input)
                     val frameNow = android.os.SystemClock.elapsedRealtime()
+                    readCalls.incrementAndGet()
+                    lastReadCompletedAtMs.set(frameNow)
                     totalRawFrames.incrementAndGet()
                     lastAnyRawFrameAtMs = frameNow
                     if (frame.channel in 0 until CHANNEL_COUNTERS) {
@@ -166,6 +184,8 @@ class AaSession(
                 }
                 frames.forEach { output.write(it) }
                 output.flush()
+                outboundFrames.addAndGet(frames.size.toLong())
+                lastWriteAtMs.set(android.os.SystemClock.elapsedRealtime())
                 null
             } catch (t: Throwable) {
                 t
@@ -216,6 +236,7 @@ class AaSession(
                 if (crypto.handshakeDone) {
                     sendPlain(AaProtocol.CH_CONTROL, AaProtocol.AUTH_COMPLETE, AaMessages.authComplete(), false)
                     _phase.value = Phase.AUTHENTICATED
+                    startKeepalive()
                     DiagLog.i(tag, "TLS handshake complete, auth complete sent")
                 }
             }
@@ -230,17 +251,39 @@ class AaSession(
                 _phase.value = Phase.DISCOVERED
             }
             AaProtocol.CHANNEL_OPEN_REQUEST -> {
-                val sid = AaMessages.channelOpenServiceId(body)
-                openChannels += channel
-                DiagLog.i(tag, "channel open ${AaProtocol.channelName(channel)} (service $sid)")
-                sendEnc(channel, AaProtocol.CHANNEL_OPEN_RESPONSE, AaMessages.channelOpenResponse(), true)
-                if (channel == AaProtocol.CH_NAVIGATION) {
-                    sendEnc(channel, AaProtocol.NAV_START, ByteArray(0))
-                    DiagLog.i(tag, "instrument cluster navigation requested")
+                // CHANNEL_OPEN_REQUEST is carried on control channel 0. Its protobuf body
+                // identifies the requested service (field 1) and the negotiated wire channel (field 2).
+                val serviceType = AaMessages.channelOpenServiceType(body)
+                val targetChannel = AaMessages.channelOpenChannelId(body)
+                if (targetChannel !in 1 until CHANNEL_COUNTERS) {
+                    DiagLog.e(tag, "invalid CHANNEL_OPEN_REQUEST service=$serviceType channel=$targetChannel bodyBytes=${body.size}")
+                    return
+                }
+                openChannels += targetChannel
+                DiagLog.i(tag, "channel open request service=$serviceType channel=$targetChannel (${AaProtocol.channelName(targetChannel)})")
+                // The acknowledgement itself belongs to the control channel, not the newly opened channel.
+                sendEnc(AaProtocol.CH_CONTROL, AaProtocol.CHANNEL_OPEN_RESPONSE, AaMessages.channelOpenResponse(), true)
+                if (serviceType == AaProtocol.SERVICE_NAVIGATION_STATUS) {
+                    sendEnc(targetChannel, AaProtocol.NAV_START, ByteArray(0))
+                    DiagLog.i(tag, "navigation status started on channel=$targetChannel")
                 }
             }
-            AaProtocol.PING_REQUEST -> sendEnc(AaProtocol.CH_CONTROL, AaProtocol.PING_RESPONSE, AaMessages.pingResponse(AaMessages.pingTimestamp(body)))
-            AaProtocol.PING_RESPONSE -> Unit
+            AaProtocol.PING_REQUEST -> {
+                DiagLog.d(tag, "phone ping request received")
+                sendEnc(AaProtocol.CH_CONTROL, AaProtocol.PING_RESPONSE, AaMessages.pingResponse(AaMessages.pingTimestamp(body)))
+            }
+            AaProtocol.PING_RESPONSE -> {
+                val echoed = AaMessages.pingTimestamp(body)
+                val now = android.os.SystemClock.elapsedRealtime()
+                val sent = lastPingToken.get()
+                if (echoed == sent && sent != 0L) {
+                    lastPingResponseToken.set(echoed)
+                    val count = pingResponses.incrementAndGet()
+                    DiagLog.i(tag, "phone ping response #$count rttMs=${(now - sent).coerceAtLeast(0L)}")
+                } else {
+                    DiagLog.w(tag, "unexpected ping response echoed=$echoed lastSent=$sent")
+                }
+            }
             AaProtocol.AUDIO_FOCUS_REQUEST -> {
                 val req = AaMessages.audioFocusRequestType(body)
                 val state = if (req == AaProtocol.AUDIO_REQUEST_RELEASE) AaProtocol.AUDIO_FOCUS_LOSS else AaProtocol.AUDIO_FOCUS_GAIN
@@ -254,11 +297,12 @@ class AaSession(
                 close("bye-bye")
             }
             AaProtocol.CHANNEL_CLOSE_NOTIFICATION -> {
-                openChannels -= channel
-                if (channel == AaProtocol.CH_NAVIGATION) synchronized(navigation) {
+                val targetChannel = AaMessages.channelOpenChannelId(body).takeIf { it in 1 until CHANNEL_COUNTERS } ?: channel
+                openChannels -= targetChannel
+                if (targetChannel == AaProtocol.CH_NAVIGATION) synchronized(navigation) {
                     AaHeadUnitService.onNavigation?.invoke(navigation.reset())
                 }
-                DiagLog.i(tag, "channel close ${AaProtocol.channelName(channel)}")
+                DiagLog.i(tag, "channel close notification target=$targetChannel (${AaProtocol.channelName(targetChannel)})")
             }
             AaProtocol.VOICE_SESSION_NOTIFICATION -> Unit
             else -> DiagLog.w(tag, "unhandled control ${AaProtocol.controlName(id)} on ${AaProtocol.channelName(channel)}")
@@ -463,6 +507,41 @@ class AaSession(
             mic.stop()
         }
         sendMicrophone(pcm)
+    }
+
+    private fun startTransportMonitor() {
+        if (transportMonitorJob != null) return
+        transportMonitorJob = scope.launch {
+            while (isActive && lifecycle.running) {
+                delay(5_000)
+                val now = android.os.SystemClock.elapsedRealtime()
+                val readStarted = lastReadStartedAtMs.get()
+                val readCompleted = lastReadCompletedAtMs.get()
+                val blockedFor = if (readStarted == 0L) -1L else now - readStarted
+                val sinceRx = if (readCompleted == 0L) -1L else now - readCompleted
+                val sinceTx = if (lastWriteAtMs.get() == 0L) -1L else now - lastWriteAtMs.get()
+                DiagLog.i(tag, "transport health phase=${_phase.value} readCalls=${readCalls.get()} readBlockedMs=$blockedFor sinceRxMs=$sinceRx sinceTxMs=$sinceTx outboundFrames=${outboundFrames.get()} pingResponses=${pingResponses.get()} missedPingRounds=${missedPingRounds.get()} openChannels=${openChannels.toList().sorted()}")
+            }
+        }
+    }
+
+    private fun startKeepalive() {
+        if (keepaliveJob != null) return
+        keepaliveJob = scope.launch {
+            while (isActive && lifecycle.running) {
+                delay(15_000)
+                if (!lifecycle.running || _phase.value < Phase.AUTHENTICATED) continue
+                val previous = lastPingToken.get()
+                if (previous != 0L && lastPingResponseToken.get() != previous) {
+                    val missed = missedPingRounds.incrementAndGet()
+                    DiagLog.w(tag, "keepalive ping unanswered round=$missed token=$previous; transport read may still be open")
+                }
+                val token = android.os.SystemClock.elapsedRealtime()
+                lastPingToken.set(token)
+                sendEnc(AaProtocol.CH_CONTROL, AaProtocol.PING_REQUEST, AaMessages.pingRequest(token))
+                DiagLog.d(tag, "keepalive ping sent token=$token")
+            }
+        }
     }
 
     companion object {
