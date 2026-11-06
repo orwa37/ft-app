@@ -333,9 +333,11 @@ class AaSession(
         }
         when (id) {
             AaProtocol.AV_SETUP_REQUEST -> {
-                DiagLog.i(tag, "video setup config=${AaMessages.setupConfigIndex(body)}")
-                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse())
-                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, false))
+                val configIndex = AaMessages.setupConfigIndex(body)
+                DiagLog.i(tag, "video setup requested configIndex=$configIndex; echoing it in AV_SETUP_RESPONSE")
+                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse(configIndex = configIndex))
+                // This is a proactive focus grant, not a reply to a phone focus request.
+                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, true))
             }
             AaProtocol.AV_START_INDICATION -> {
                 DiagLog.w(tag, "VIDEO EVENT: AV_START_INDICATION bodyBytes=${body.size}")
@@ -400,7 +402,7 @@ class AaSession(
                 }
                 decoder.askForAFreshPicture = { scope.launch { askForAFreshPicture() } }
                 DiagLog.i(tag, "video start session=$videoSession")
-                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, false))
+                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, true))
             }
             AaProtocol.AV_STOP_INDICATION -> {
                 DiagLog.w(tag, "VIDEO EVENT: AV_STOP_INDICATION bodyBytes=${body.size}")
@@ -460,7 +462,11 @@ class AaSession(
 
     private fun handleAudioSink(channel: Int, id: Int, body: ByteArray) {
         when (id) {
-            AaProtocol.AV_SETUP_REQUEST -> sendEnc(channel, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse())
+            AaProtocol.AV_SETUP_REQUEST -> {
+                val configIndex = AaMessages.setupConfigIndex(body)
+                DiagLog.i(tag, "${AaProtocol.channelName(channel)} setup configIndex=$configIndex; echoing selected config")
+                sendEnc(channel, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse(configIndex = configIndex))
+            }
             AaProtocol.AV_START_INDICATION -> {
                 audioSessions[channel] = AaMessages.startSession(body)
                 audioMeasured -= channel
@@ -561,7 +567,10 @@ class AaSession(
 
     private fun handleAvInput(id: Int, body: ByteArray) {
         when (id) {
-            AaProtocol.AV_SETUP_REQUEST -> sendEnc(AaProtocol.CH_AV_INPUT, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse())
+            AaProtocol.AV_SETUP_REQUEST -> {
+                val configIndex = AaMessages.setupConfigIndex(body)
+                sendEnc(AaProtocol.CH_AV_INPUT, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse(configIndex = configIndex))
+            }
             AaProtocol.AV_INPUT_OPEN_REQUEST -> {
                 val wanted = AaMessages.avInputOpenWanted(body)
                 sendEnc(AaProtocol.CH_AV_INPUT, AaProtocol.AV_INPUT_OPEN_RESPONSE, AaMessages.avInputOpenResponse(if (wanted) 0 else AaMessages.avInputOpenSession(body)))
