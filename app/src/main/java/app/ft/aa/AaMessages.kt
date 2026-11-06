@@ -124,6 +124,7 @@ object AaMessages {
     fun sensorStartResponse(): ByteArray = ProtoWriter().enum(1, AaProtocol.STATUS_OK).toByteArray()
     fun sensorDrivingStatus(status: Int): ByteArray = ProtoWriter().message(13, ProtoWriter().int32(1, status)).toByteArray()
     fun sensorNightMode(night: Boolean): ByteArray = ProtoWriter().message(10, ProtoWriter().bool(1, night)).toByteArray()
+    fun pingRequest(timestamp: Long): ByteArray = ProtoWriter().int64(1, timestamp).toByteArray()
     fun pingResponse(timestamp: Long): ByteArray = ProtoWriter().int64(1, timestamp).toByteArray()
     fun audioFocusNotification(state: Int): ByteArray = ProtoWriter().enum(1, state).bool(2, false).toByteArray()
     fun navFocusNotification(type: Int): ByteArray = ProtoWriter().enum(1, type).toByteArray()
@@ -148,7 +149,9 @@ object AaMessages {
             .toByteArray()
 
     fun deviceName(b: ByteArray): String = ProtoReader(b).let { it.string(5) ?: it.string(4) ?: Build.MODEL }
-    fun channelOpenServiceId(b: ByteArray): Int = ProtoReader(b).int(2, -1)
+    // ChannelOpenRequest: field 1 = service_type, field 2 = negotiated channel_id.
+    fun channelOpenServiceType(b: ByteArray): Int = ProtoReader(b).int(1, -1)
+    fun channelOpenChannelId(b: ByteArray): Int = ProtoReader(b).int(2, -1)
     fun setupConfigIndex(b: ByteArray): Int = ProtoReader(b).int(1, 0)
     fun startSession(b: ByteArray): Int = ProtoReader(b).int(1, 0)
     fun videoFocusRequestMode(b: ByteArray): Int = ProtoReader(b).int(2, AaProtocol.VIDEO_FOCUS_PROJECTED)
