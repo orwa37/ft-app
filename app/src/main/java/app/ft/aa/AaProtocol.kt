@@ -13,6 +13,9 @@ object AaProtocol {
     const val CH_MEDIA_STATUS = 9
     const val CH_NAVIGATION = 10
 
+    // Stable GAL service type used by ChannelOpenRequest (not the wire channel ID).
+    const val SERVICE_NAVIGATION_STATUS = 10
+
     const val NAV_START = 0x8001
     const val NAV_STATUS = 0x8003
     const val NAV_NEXT_TURN = 0x8004
