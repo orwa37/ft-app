@@ -52,6 +52,10 @@ class AaCrypto(context: Context) {
         }
     }
 
+    /** Negotiated TLS details; call after handshakeDone. */
+    fun sessionDescription(): String =
+        "${engine.session.protocol} ${engine.session.cipherSuite}"
+
     private fun loadKey(pem: String): PrivateKey {
         val b64 = pem.lines().filter { !it.startsWith("-----") }.joinToString("")
         val der = Base64.decode(b64, Base64.DEFAULT)
