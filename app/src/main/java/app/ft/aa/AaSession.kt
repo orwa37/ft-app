@@ -235,7 +235,7 @@ class AaSession(
                 if (crypto.handshakeDone) {
                     sendPlain(AaProtocol.CH_CONTROL, AaProtocol.AUTH_COMPLETE, AaMessages.authComplete(), false)
                     _phase.value = Phase.AUTHENTICATED
-                    DiagLog.i(tag, "TLS handshake complete, auth complete sent")
+                    DiagLog.i(tag, "TLS handshake complete (${crypto.sessionDescription()}), auth complete sent")
                 }
             }
             AaProtocol.SERVICE_DISCOVERY_REQUEST -> {
