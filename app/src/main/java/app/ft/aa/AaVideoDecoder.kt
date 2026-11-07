@@ -107,36 +107,40 @@ class AaVideoDecoder(private val width: Int, private val height: Int) {
                 stopLocked()
                 missed++
             }
-            if (!running.get() && config != null) startLocked()
+            // Wait for the next IDR on the new surface, as Headswap does.
         }
     }
 
     fun onConfig(csd: ByteArray) {
         val copy = csd.copyOf()
         synchronized(lock) {
+            if (config?.contentEquals(copy) == true) return
             config = copy
-            if (!running.get()) {
-                if (surface != null) startLocked()
-                return
-            }
-            feedLocked(copy, true)
+            // Match Headswap: wait for an IDR before starting/restarting the decoder.
+            stopLocked()
         }
     }
 
     fun onFrame(data: ByteArray, ptsUs: Long) {
         synchronized(lock) {
+            if (surface?.isValid != true) {
+                if (surface != null) {
+                    DiagLog.w(tag, "the car screen surface is no longer valid, stopping the decoder")
+                    surface = null
+                    stopLocked()
+                }
+                return
+            }
             if (!running.get()) {
-                if (surface != null && config != null) startLocked()
+                if (surface == null || config == null || !isKeyFrame(data)) {
+                    missed++
+                    return
+                }
+                startLocked()
                 if (!running.get()) {
                     missed++
                     return
                 }
-            }
-            if (surface?.isValid != true) {
-                DiagLog.w(tag, "the car screen surface is no longer valid, stopping the decoder")
-                surface = null
-                stopLocked()
-                return
             }
             feedLocked(data, false, ptsUs)
         }
@@ -158,13 +162,22 @@ class AaVideoDecoder(private val width: Int, private val height: Int) {
         var made: MediaCodec? = null
         try {
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
-            format.setByteBuffer("csd-0", ByteBuffer.wrap(csd))
+            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1 shl 20)
             format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             val c = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             made = c
             c.configure(format, s, null, 0)
             c.start()
             codec = c
+            // Headswap queues SPS/PPS as a CODEC_CONFIG input buffer after start.
+            val configSlot = c.dequeueInputBuffer(100_000)
+            if (configSlot < 0) throw IllegalStateException("no decoder input buffer for codec config")
+            val configBuffer = c.getInputBuffer(configSlot)
+                ?: throw IllegalStateException("decoder returned a null codec-config input buffer")
+            configBuffer.clear()
+            if (csd.size > configBuffer.remaining()) throw IllegalArgumentException("codec config does not fit decoder input buffer")
+            configBuffer.put(csd)
+            c.queueInputBuffer(configSlot, 0, csd.size, 0L, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
             made = null
             AaVideoSink.frameSize(width, height)
             lastInputAtMs = SystemClock.elapsedRealtime()
@@ -288,6 +301,24 @@ class AaVideoDecoder(private val width: Int, private val height: Int) {
             runCatching { dead.release() }
             DiagLog.w(tag, "the decoder stopped; FT will retry after ${START_RETRY_DELAY_MS}ms")
         }
+    }
+
+    // H.264 Annex-B IDR (NAL type 5), matching Headswap's keyframe gate.
+    private fun isKeyFrame(data: ByteArray): Boolean {
+        var i = 0
+        while (i + 3 < data.size) {
+            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() && data[i + 2] == 1.toByte()) {
+                val type = data[i + 3].toInt() and 0x1F
+                if (type == 5 || type == 7) return true
+                i += 3
+            } else if (i + 4 < data.size && data[i] == 0.toByte() && data[i + 1] == 0.toByte() &&
+                data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte()) {
+                val type = data[i + 4].toInt() and 0x1F
+                if (type == 5 || type == 7) return true
+                i += 4
+            } else i++
+        }
+        return false
     }
 
     private fun shown(f: MediaFormat) {
