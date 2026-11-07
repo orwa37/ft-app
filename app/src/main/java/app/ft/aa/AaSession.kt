@@ -241,9 +241,16 @@ class AaSession(
 
     fun askForAFreshPicture() {
         if (_phase.value != Phase.STREAMING) return
-        runCatching {
-            sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, true))
-        }.onFailure { DiagLog.w(tag, "could not ask Android Auto for a fresh picture: ${it.message}") }
+        scope.launch {
+            runCatching {
+                // Match Headswap: release video focus, then reclaim it to request a keyframe.
+                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_NATIVE, false))
+                delay(500)
+                if (_phase.value == Phase.STREAMING) {
+                    sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, true))
+                }
+            }.onFailure { DiagLog.w(tag, "could not request a fresh picture: ${it.message}") }
+        }
     }
 
     private fun handleVideo(id: Int, body: ByteArray) {
@@ -302,8 +309,8 @@ class AaSession(
                     }
                 }
                 decoder.askForAFreshPicture = { scope.launch { askForAFreshPicture() } }
-                DiagLog.i(tag, "video start session=$videoSession")
-                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, false))
+                DiagLog.i(tag, "video MEDIA_START payload=${body.joinToString(" ") { "%02x".format(it) }} session=$videoSession")
+                // Headswap sends VIDEO_FOCUS only after MEDIA_SETUP, not again at MEDIA_START.
             }
             AaProtocol.AV_STOP_INDICATION -> {
                 DiagLog.i(tag, "video stop")
@@ -315,6 +322,7 @@ class AaSession(
             AaProtocol.AV_MEDIA_INDICATION -> {
                 DiagLog.i(tag, "video codec config ${body.size} bytes")
                 decoder.onConfig(body)
+                DiagLog.i(tag, "video ACK tx channel=${AaProtocol.CH_VIDEO} type=CODEC_CONFIG session=$videoSession")
                 sendEnc(AaProtocol.CH_VIDEO, AaProtocol.AV_MEDIA_ACK, AaMessages.mediaAck(videoSession))
             }
             AaProtocol.AV_MEDIA_WITH_TIMESTAMP -> {
@@ -323,6 +331,9 @@ class AaSession(
                     mediaFrames++
                     if (mediaFrames <= 3 || mediaFrames % 300 == 0L) DiagLog.d(tag, "video frame #$mediaFrames ${body.size - 8} bytes, ${decoder.frames.value} drawn on the car screen")
                     decoder.onFrame(body.copyOfRange(8, body.size), ts)
+                }
+                if (mediaFrames <= 3L || mediaFrames % 300L == 0L) {
+                    DiagLog.i(tag, "video ACK tx channel=${AaProtocol.CH_VIDEO} type=DATA session=$videoSession frame=$mediaFrames bytes=${body.size - 8}")
                 }
                 sendEnc(AaProtocol.CH_VIDEO, AaProtocol.AV_MEDIA_ACK, AaMessages.mediaAck(videoSession))
             }
