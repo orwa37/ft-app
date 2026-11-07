@@ -26,6 +26,7 @@ class AaSession(
     private val prefs: Prefs,
     private val scope: CoroutineScope,
     private val decoder: AaVideoDecoder,
+    private val sessionId: Long,
     private val onClosed: (String) -> Unit
 ) {
     enum class Phase { CONNECTED, VERSIONED, HANDSHAKING, AUTHENTICATED, DISCOVERED, STREAMING }
@@ -35,6 +36,10 @@ class AaSession(
     private val assembler = AaFraming.Assembler { crypto.decrypt(it) }
     private val outLock = Any()
     private var job: Job? = null
+    @Volatile private var lastControlRxAtMs = 0L
+    @Volatile private var lastControlTxAtMs = 0L
+    @Volatile private var lastControlRx = "none"
+    @Volatile private var lastControlTx = "none"
     private val lifecycle = AaSessionLifecycle(
         interrupt = {
             runCatching { input.close() }
@@ -108,6 +113,7 @@ class AaSession(
             } catch (t: Throwable) {
                 reason = "read ${t.javaClass.simpleName}: ${t.message}"
                 if (lifecycle.running) DiagLog.w(tag, "session ended: $reason")
+                DiagLog.w(tag, "AAP EOF context session=$sessionId phase=${_phase.value} lastControlRx='$lastControlRx' rxAgeMs=${age(lastControlRxAtMs)} lastControlTx='$lastControlTx' txAgeMs=${age(lastControlTxAtMs)} videoSession=$videoSession videoPackets=${videoPackets.get()} rawVideoFrames=${rawVideoFrames.get()}")
             } finally {
                 close(reason)
             }
@@ -130,10 +136,13 @@ class AaSession(
         val payload = ByteArray(2 + body.size)
         Bytes.putU16(id, payload, 0)
         System.arraycopy(body, 0, payload, 2, body.size)
+        val protocolControl = control || (channel != AaProtocol.CH_CONTROL && id in 1..26)
+        val traceControl = channel == AaProtocol.CH_CONTROL || protocolControl
+        val messageLabel = messageLabel(channel, id, protocolControl)
+        if (traceControl) DiagLog.i(tag, "AAP TX begin session=$sessionId t=${android.os.SystemClock.elapsedRealtime()} phase=${_phase.value} $messageLabel encrypted=$encrypted bodyBytes=${body.size}")
         val failure = synchronized(outLock) {
             if (!lifecycle.running) return
             try {
-                val protocolControl = control || (channel != AaProtocol.CH_CONTROL && id in 1..26)
                 val frames = AaFraming.encode(channel, payload, encrypted, protocolControl) { if (encrypted) crypto.encrypt(it) else it }
                 frames.forEach { output.write(it) }
                 output.flush()
@@ -143,8 +152,12 @@ class AaSession(
             }
         }
         if (failure != null) {
-            if (lifecycle.running) DiagLog.e(tag, "write failed", failure)
+            if (lifecycle.running) DiagLog.e(tag, "AAP TX FAILED session=$sessionId phase=${_phase.value} $messageLabel", failure)
             close("write ${failure.javaClass.simpleName}: ${failure.message}")
+        } else if (traceControl) {
+            lastControlTxAtMs = android.os.SystemClock.elapsedRealtime()
+            lastControlTx = messageLabel
+            DiagLog.i(tag, "AAP TX ok session=$sessionId t=$lastControlTxAtMs $messageLabel")
         }
     }
 
@@ -152,6 +165,10 @@ class AaSession(
         val id = m.id
         val body = m.body
         if (m.channel == AaProtocol.CH_CONTROL || m.control) {
+            val label = messageLabel(m.channel, id, m.control)
+            lastControlRxAtMs = android.os.SystemClock.elapsedRealtime()
+            lastControlRx = label
+            DiagLog.i(tag, "AAP RX session=$sessionId t=$lastControlRxAtMs phase=${_phase.value} $label encrypted=${m.encrypted} bodyBytes=${body.size}")
             handleControl(m.channel, id, body)
             return
         }
@@ -168,6 +185,24 @@ class AaSession(
             }
             else -> DiagLog.d(tag, "${AaProtocol.channelName(m.channel)} msg 0x${Integer.toHexString(id)} len=${body.size}")
         }
+    }
+
+
+    private fun age(timestamp: Long): Long =
+        if (timestamp == 0L) -1L else android.os.SystemClock.elapsedRealtime() - timestamp
+
+    private fun messageLabel(channel: Int, id: Int, control: Boolean): String {
+        val name = when {
+            channel == AaProtocol.CH_CONTROL -> AaProtocol.controlName(id)
+            channel == AaProtocol.CH_VIDEO -> AaProtocol.avName(id)
+            channel == AaProtocol.CH_SENSOR -> when (id) {
+                AaProtocol.SENSOR_START_REQUEST -> "SENSOR_START_REQUEST"
+                AaProtocol.SENSOR_EVENT_INDICATION -> "SENSOR_EVENT_INDICATION"
+                else -> "0x%04X".format(id)
+            }
+            else -> "0x%04X".format(id)
+        }
+        return "channel=${AaProtocol.channelName(channel)} id=0x%04X name=$name control=$control".format(id)
     }
 
     private fun handleControl(channel: Int, id: Int, body: ByteArray) {
