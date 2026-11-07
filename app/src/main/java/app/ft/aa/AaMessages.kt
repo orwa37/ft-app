@@ -126,6 +126,19 @@ object AaMessages {
     fun sensorNightMode(night: Boolean): ByteArray = ProtoWriter().message(10, ProtoWriter().bool(1, night)).toByteArray()
     fun pingResponse(timestamp: Long): ByteArray = ProtoWriter().int64(1, timestamp).toByteArray()
     fun audioFocusNotification(state: Int): ByteArray = ProtoWriter().enum(1, state).bool(2, false).toByteArray()
+    fun audioFocusResponse(request: Int): ByteArray? {
+        val state = when (request) {
+            1 -> AaProtocol.AUDIO_FOCUS_GAIN
+            2 -> AaProtocol.AUDIO_FOCUS_GAIN_TRANSIENT
+            3 -> AaProtocol.AUDIO_FOCUS_GAIN_TRANSIENT_GUIDANCE_ONLY
+            4 -> AaProtocol.AUDIO_FOCUS_LOSS
+            else -> return null
+        }
+        // Match Headswap: solicited response contains focus_state only (no unsolicited field).
+        return ProtoWriter().enum(1, state).toByteArray()
+    }
+    fun audioFocusGainUnsolicited(): ByteArray =
+        ProtoWriter().enum(1, AaProtocol.AUDIO_FOCUS_GAIN).bool(2, true).toByteArray()
     fun navFocusNotification(type: Int): ByteArray = ProtoWriter().enum(1, type).toByteArray()
     fun byeByeResponse(): ByteArray = ByteArray(0)
     fun avInputOpenResponse(session: Int): ByteArray = ProtoWriter().int32(1, session).int32(2, 0).toByteArray()
