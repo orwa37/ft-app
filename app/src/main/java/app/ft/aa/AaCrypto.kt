@@ -43,10 +43,11 @@ class AaCrypto(context: Context) {
             override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) = Unit
             override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
         })
-        val ctx = SSLContext.getInstance("TLSv1.2").apply { init(kmf.keyManagers, trustAll, SecureRandom()) }
-        engine = ctx.createSSLEngine().apply {
+        // Match Headswap's AAP TLS client: use the platform TLS defaults and
+        // provide the Android Auto peer host/port when creating the engine.
+        val ctx = SSLContext.getInstance("TLS").apply { init(kmf.keyManagers, trustAll, SecureRandom()) }
+        engine = ctx.createSSLEngine("android-auto", 5277).apply {
             useClientMode = true
-            enabledProtocols = arrayOf("TLSv1.2")
             beginHandshake()
         }
     }
