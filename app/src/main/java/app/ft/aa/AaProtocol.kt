@@ -2,12 +2,12 @@ package app.ft.aa
 
 object AaProtocol {
     const val CH_CONTROL = 0
-    const val CH_INPUT = 1
-    const val CH_SENSOR = 2
-    const val CH_VIDEO = 3
-    const val CH_MEDIA_AUDIO = 4
-    const val CH_SPEECH_AUDIO = 5
-    const val CH_SYSTEM_AUDIO = 6
+    const val CH_SENSOR = 1
+    const val CH_VIDEO = 2
+    const val CH_INPUT = 3
+    const val CH_SPEECH_AUDIO = 4
+    const val CH_SYSTEM_AUDIO = 5
+    const val CH_MEDIA_AUDIO = 6
     const val CH_AV_INPUT = 7
     const val CH_BLUETOOTH = 8
     const val CH_MEDIA_STATUS = 9
