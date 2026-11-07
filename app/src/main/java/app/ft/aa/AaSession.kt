@@ -91,6 +91,7 @@ class AaSession(
     private val navigation = AaNavigation()
     private val mic = AaMicrophone { pcm -> sendMicrophone(pcm) }
     @Volatile private var micWanted = false
+    private var micSessionId = 0
     @Volatile private var carMicAt = 0L
 
     fun start() {
@@ -243,7 +244,7 @@ class AaSession(
                 DiagLog.i(tag, "video settings ${prefs.aaWidth}x${prefs.aaHeight}@${prefs.aaFps} fps")
                 sendEnc(
                     AaProtocol.CH_CONTROL, AaProtocol.SERVICE_DISCOVERY_RESPONSE,
-                    AaMessages.serviceDiscoveryResponse(prefs.aaWidth, prefs.aaHeight, prefs.aaFps, prefs.aaDensity, true, prefs.carName, prefs.aaControlsLeft)
+                    AaMessages.serviceDiscoveryResponse(prefs.aaWidth, prefs.aaHeight, prefs.aaFps, prefs.aaDensity, false, prefs.carName, prefs.aaControlsLeft)
                 )
                 _phase.value = Phase.DISCOVERED
             }
@@ -491,7 +492,10 @@ class AaSession(
             AaProtocol.AV_SETUP_REQUEST -> sendEnc(AaProtocol.CH_AV_INPUT, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse())
             AaProtocol.AV_INPUT_OPEN_REQUEST -> {
                 val wanted = AaMessages.avInputOpenWanted(body)
-                sendEnc(AaProtocol.CH_AV_INPUT, AaProtocol.AV_INPUT_OPEN_RESPONSE, AaMessages.avInputOpenResponse(if (wanted) 0 else AaMessages.avInputOpenSession(body)))
+                if (wanted && !micWanted) {
+                    micSessionId = if (micSessionId == Int.MAX_VALUE) 1 else micSessionId + 1
+                }
+                sendEnc(AaProtocol.CH_AV_INPUT, AaProtocol.AV_INPUT_OPEN_RESPONSE, AaMessages.avInputOpenResponse(true, micSessionId))
                 if (wanted != micWanted) DiagLog.i(tag, if (wanted) "Android Auto opened the microphone" else "Android Auto closed the microphone")
                 micWanted = wanted
                 runCatching { AaHeadUnitService.onCarMicWanted?.invoke(wanted) }

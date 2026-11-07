@@ -41,16 +41,22 @@ object AaMessages {
                             .uint32(3, marginW)
                             .uint32(4, marginH)
                             .uint32(5, density)
+                            .uint32(8, 10000)
+                            .enum(10, AaProtocol.CODEC_H264)
                     )
                     .bool(5, true)
             )
-        val keycodes = listOf(3, 4, 5, 6, 19, 20, 21, 22, 23, 24, 25, 84, 85, 86, 87, 88, 126, 127, 65536, 65537, 65538)
+        val keycodes = listOf(
+            1, 2, 4, 19, 20, 21, 22, 23, 126, 127, 85, 87, 88, 84, 5, 209, 24, 25, 61, 62, 66, 3, 79, 86,
+            6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+            81, 224, 264, 265, 267, 268, 269, 270, 271, 65536, 65537, 65538,
+        ).toSortedSet().toList()
         val input = ProtoWriter()
             .int32(1, AaProtocol.CH_INPUT)
             .message(
                 4, ProtoWriter()
                     .packedInts(1, keycodes)
-                    .message(2, ProtoWriter().int32(1, width).int32(2, height).int32(3, 1))
+                    .message(2, ProtoWriter().int32(1, width).int32(2, height))
             )
         val sensor = ProtoWriter()
             .int32(1, AaProtocol.CH_SENSOR)
@@ -65,52 +71,57 @@ object AaMessages {
             .message(1, sensor)
             .message(1, ProtoWriter().int32(1, AaProtocol.CH_NAVIGATION)
                 .message(8, ProtoWriter().int32(1, 1000).enum(2, 2)))
-        if (advertiseAudio) {
-            fun sink(ch: Int, type: Int, rate: Int, channels: Int) = ProtoWriter()
-                .int32(1, ch)
-                .message(
-                    3, ProtoWriter()
-                        .enum(1, AaProtocol.CODEC_AUDIO_PCM)
-                        .enum(2, type)
-                        .message(3, ProtoWriter().uint32(1, rate).uint32(2, 16).uint32(3, channels))
-                        .bool(5, true)
-                )
-            w.message(1, sink(AaProtocol.CH_MEDIA_AUDIO, AaProtocol.AUDIO_TYPE_MEDIA, 48000, 2))
-            w.message(1, sink(AaProtocol.CH_SPEECH_AUDIO, AaProtocol.AUDIO_TYPE_SPEECH, 16000, 1))
-            w.message(1, sink(AaProtocol.CH_SYSTEM_AUDIO, AaProtocol.AUDIO_TYPE_SYSTEM, 16000, 1))
-            w.message(
-                1, ProtoWriter()
-                    .int32(1, AaProtocol.CH_AV_INPUT)
-                    .message(
-                        5, ProtoWriter()
-                            .enum(1, AaProtocol.CODEC_AUDIO_PCM)
-                            .message(2, ProtoWriter().uint32(1, 16000).uint32(2, 16).uint32(3, 1))
-                            .bool(3, true)
-                    )
+        fun sink(ch: Int, type: Int, rate: Int, channels: Int) = ProtoWriter()
+            .int32(1, ch)
+            .message(
+                3, ProtoWriter()
+                    .enum(1, AaProtocol.CODEC_AUDIO_PCM)
+                    .enum(2, type)
+                    .message(3, ProtoWriter().uint32(1, rate).uint32(2, 16).uint32(3, channels))
+                    .bool(5, true)
             )
+        // Match Headswap's default: system audio is always present; extra media/speech
+        // sinks are opt-in because some Android Auto builds open them during display setup.
+        w.message(1, sink(AaProtocol.CH_SYSTEM_AUDIO, AaProtocol.AUDIO_TYPE_SYSTEM, 16000, 1))
+        if (advertiseAudio) {
+            w.message(1, sink(AaProtocol.CH_SPEECH_AUDIO, AaProtocol.AUDIO_TYPE_SPEECH, 16000, 1))
+            w.message(1, sink(AaProtocol.CH_MEDIA_AUDIO, AaProtocol.AUDIO_TYPE_MEDIA, 48000, 2))
         }
-        w.string(2, name)
-            .string(3, "Universal")
-            .string(4, "2024")
-            .string(5, "0001")
+        // CH_AV_INPUT is the microphone service (channel 7), equivalent to Headswap's CH_MIC.
+        w.message(
+            1, ProtoWriter()
+                .int32(1, AaProtocol.CH_AV_INPUT)
+                .message(
+                    5, ProtoWriter()
+                        .enum(1, AaProtocol.CODEC_AUDIO_PCM)
+                        .message(2, ProtoWriter().uint32(1, 16000).uint32(2, 16).uint32(3, 1))
+                )
+        )
+        val vehicleId = "headlessunit-001"
+        w.string(2, "Google")
+            .string(3, "Desktop Head Unit")
+            .string(4, "2025")
+            .string(5, vehicleId)
             .varint(6, if (controlsLeft) 0L else 1L)
-            .string(7, "FT")
-            .string(8, "FT")
+            .string(7, "Google")
+            .string(8, "Desktop Head Unit")
             .string(9, "1")
-            .string(10, "1.0")
+            .string(10, "0.1.0")
             .bool(11, false)
             .bool(12, false)
+            .varint(13, 0L)
             .string(14, name)
             .message(
                 17, ProtoWriter()
-                    .string(1, name)
-                    .string(2, "Universal")
-                    .string(3, "2024")
-                    .string(4, "0001")
-                    .string(5, "FT")
-                    .string(6, "FT")
+                    .string(1, "Google")
+                    .string(2, "Desktop Head Unit")
+                    .string(3, "2025")
+                    .string(4, vehicleId)
+                    .string(5, "Google")
+                    .string(6, "Desktop Head Unit")
                     .string(7, "1")
-                    .string(8, "1.0")
+                    .string(8, "0.1.0")
+                    .varint(9, 1L)
             )
         return w.toByteArray()
     }
@@ -141,7 +152,8 @@ object AaMessages {
         ProtoWriter().enum(1, AaProtocol.AUDIO_FOCUS_GAIN).bool(2, true).toByteArray()
     fun navFocusNotification(type: Int): ByteArray = ProtoWriter().enum(1, type).toByteArray()
     fun byeByeResponse(): ByteArray = ByteArray(0)
-    fun avInputOpenResponse(session: Int): ByteArray = ProtoWriter().int32(1, session).int32(2, 0).toByteArray()
+    fun avInputOpenResponse(success: Boolean, session: Int): ByteArray =
+        ProtoWriter().int32(1, if (success) AaProtocol.STATUS_OK else -7).int32(2, session).toByteArray()
 
     fun inputTouch(timestampNs: Long, x: Int, y: Int, action: Int, pointerId: Int = 0): ByteArray =
         ProtoWriter()

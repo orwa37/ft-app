@@ -29,7 +29,7 @@ object AaProtocol {
     const val MAX_FRAME_PAYLOAD = 0x4000
 
     const val PROTOCOL_MAJOR = 1
-    const val PROTOCOL_MINOR = 1
+    const val PROTOCOL_MINOR = 2
 
     const val VERSION_REQUEST = 1
     const val VERSION_RESPONSE = 2
