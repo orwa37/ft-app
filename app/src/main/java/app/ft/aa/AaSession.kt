@@ -14,8 +14,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.atomic.AtomicLongArray
-import java.util.concurrent.atomic.AtomicIntegerArray
 import java.io.InputStream
 import java.io.OutputStream
 
@@ -25,7 +23,6 @@ class AaSession(
     context: Context,
     private val input: InputStream,
     private val output: OutputStream,
-    private val transportState: () -> String,
     private val prefs: Prefs,
     private val scope: CoroutineScope,
     private val decoder: AaVideoDecoder,
@@ -43,9 +40,6 @@ class AaSession(
             runCatching { input.close() }
             runCatching { output.close() }
             job?.cancel()
-            transportMonitorJob?.cancel()
-            keepaliveJob?.cancel()
-            videoMonitor?.cancel()
         },
         cleanup = { reason ->
             runCatching { mic.stop() }
@@ -64,28 +58,9 @@ class AaSession(
     private val audioMeasured = HashSet<Int>()
     @Volatile private var mediaFrames = 0L
     private var videoMonitor: Job? = null
-    private var transportMonitorJob: Job? = null
-    private var keepaliveJob: Job? = null
-    private val readCalls = AtomicLong(0L)
-    private val outboundFrames = AtomicLong(0L)
-    private val lastReadStartedAtMs = AtomicLong(0L)
-    private val lastReadCompletedAtMs = AtomicLong(0L)
-    private val lastWriteAtMs = AtomicLong(0L)
-    private val lastPingToken = AtomicLong(0L)
-    private val lastPingResponseToken = AtomicLong(0L)
-    private val pingResponses = AtomicLong(0L)
-    private val missedPingRounds = AtomicLong(0L)
     // Counts raw channel-3 frames before decryption/assembly/dispatch. This distinguishes
     // a phone-side video stall from a framing, crypto, or message-assembly problem.
     private val rawVideoFrames = AtomicLong(0L)
-    private val rawFramesByChannel = AtomicLongArray(CHANNEL_COUNTERS)
-    private val rawBytesByChannel = AtomicLongArray(CHANNEL_COUNTERS)
-    private val dispatchedMessagesByChannel = AtomicLongArray(CHANNEL_COUNTERS)
-    private val lastDispatchedIdByChannel = AtomicIntegerArray(CHANNEL_COUNTERS)
-    private val lastDispatchedAtByChannel = AtomicLongArray(CHANNEL_COUNTERS)
-    private val totalRawFrames = AtomicLong(0L)
-    @Volatile private var lastAnyRawFrameAtMs = 0L
-    private val outboundVideoAcks = AtomicLong(0L)
     private val rawVideoBytes = AtomicLong(0L)
     @Volatile private var lastRawVideoFrameAtMs = 0L
     private val videoPackets = AtomicLong(0L)
@@ -103,7 +78,7 @@ class AaSession(
         private set
     private val _deviceName = MutableStateFlow("")
     val deviceName: StateFlow<String> = _deviceName
-    private val openChannels = java.util.Collections.synchronizedSet(HashSet<Int>())
+    private val openChannels = HashSet<Int>()
     private val navigation = AaNavigation()
     private val mic = AaMicrophone { pcm -> sendMicrophone(pcm) }
     @Volatile private var micWanted = false
@@ -116,19 +91,8 @@ class AaSession(
             try {
                 sendPlain(AaProtocol.CH_CONTROL, AaProtocol.VERSION_REQUEST, AaMessages.versionRequest(), false)
                 DiagLog.i(tag, "version request sent")
-                startTransportMonitor()
                 while (isActive && lifecycle.running) {
-                    lastReadStartedAtMs.set(android.os.SystemClock.elapsedRealtime())
                     val frame = AaFraming.readFrame(input)
-                    val frameNow = android.os.SystemClock.elapsedRealtime()
-                    readCalls.incrementAndGet()
-                    lastReadCompletedAtMs.set(frameNow)
-                    totalRawFrames.incrementAndGet()
-                    lastAnyRawFrameAtMs = frameNow
-                    if (frame.channel in 0 until CHANNEL_COUNTERS) {
-                        rawFramesByChannel.incrementAndGet(frame.channel)
-                        rawBytesByChannel.addAndGet(frame.channel, frame.payload.size.toLong())
-                    }
                     if (frame.channel == AaProtocol.CH_VIDEO) {
                         val rawCount = rawVideoFrames.incrementAndGet()
                         rawVideoBytes.addAndGet(frame.payload.size.toLong())
@@ -138,14 +102,7 @@ class AaSession(
                         }
                     }
                     lifecycle.dispatch {
-                        assembler.feed(frame)?.let { message ->
-                            if (message.channel in 0 until CHANNEL_COUNTERS) {
-                                dispatchedMessagesByChannel.incrementAndGet(message.channel)
-                                lastDispatchedIdByChannel.set(message.channel, message.id)
-                                lastDispatchedAtByChannel.set(message.channel, android.os.SystemClock.elapsedRealtime())
-                            }
-                            dispatch(message)
-                        }
+                        assembler.feed(frame)?.let { dispatch(it) }
                     }
                 }
             } catch (t: Throwable) {
@@ -176,24 +133,9 @@ class AaSession(
         val failure = synchronized(outLock) {
             if (!lifecycle.running) return
             try {
-                // CONTROL is a per-message flag, not something implied by channel 0.
-                // VERSION/TLS/auth and other channel-0 messages use BULK flags; control
-                // messages carried on service channels explicitly opt in at the call site.
                 val frames = AaFraming.encode(channel, payload, encrypted, control) { if (encrypted) crypto.encrypt(it) else it }
-                if (channel == AaProtocol.CH_CONTROL && outboundFrames.get() < 40L) {
-                    val flags = frames.firstOrNull()?.getOrNull(1)?.toInt()?.and(0xff) ?: -1
-                    DiagLog.d(tag, "TX CONTROL ${AaProtocol.controlName(id)} encrypted=$encrypted flags=0x${Integer.toHexString(flags)} bytes=${body.size}")
-                }
-                if (channel == AaProtocol.CH_VIDEO && id == AaProtocol.AV_MEDIA_ACK) {
-                    val ackCount = outboundVideoAcks.incrementAndGet()
-                    if (ackCount <= 5L || ackCount % 100L == 0L) {
-                        DiagLog.d(tag, "video media ACK sent #$ackCount")
-                    }
-                }
                 frames.forEach { output.write(it) }
                 output.flush()
-                outboundFrames.addAndGet(frames.size.toLong())
-                lastWriteAtMs.set(android.os.SystemClock.elapsedRealtime())
                 null
             } catch (t: Throwable) {
                 t
@@ -244,7 +186,6 @@ class AaSession(
                 if (crypto.handshakeDone) {
                     sendPlain(AaProtocol.CH_CONTROL, AaProtocol.AUTH_COMPLETE, AaMessages.authComplete(), false)
                     _phase.value = Phase.AUTHENTICATED
-                    startKeepalive()
                     DiagLog.i(tag, "TLS handshake complete, auth complete sent")
                 }
             }
@@ -259,40 +200,17 @@ class AaSession(
                 _phase.value = Phase.DISCOVERED
             }
             AaProtocol.CHANNEL_OPEN_REQUEST -> {
-                // Android Auto may carry this control message on the service channel being opened.
-                // The request body is priority (field 1) + channel ID (field 2), not service_type.
-                val priority = AaMessages.channelOpenPriority(body)
-                val targetChannel = AaMessages.channelOpenChannelId(body)
-                if (targetChannel !in 1 until CHANNEL_COUNTERS) {
-                    DiagLog.e(tag, "invalid CHANNEL_OPEN_REQUEST priority=$priority frameChannel=$channel channel=$targetChannel bodyBytes=${body.size}")
-                    return
-                }
-                openChannels += targetChannel
-                DiagLog.i(tag, "channel open request priority=$priority frameChannel=$channel targetChannel=$targetChannel (${AaProtocol.channelName(targetChannel)})")
-                // Android Auto carries CHANNEL_OPEN_REQUEST on the service channel;
-                // acknowledge on that same incoming channel with the CONTROL flag.
+                val sid = AaMessages.channelOpenServiceId(body)
+                openChannels += channel
+                DiagLog.i(tag, "channel open ${AaProtocol.channelName(channel)} (service $sid)")
                 sendEnc(channel, AaProtocol.CHANNEL_OPEN_RESPONSE, AaMessages.channelOpenResponse(), true)
-                if (targetChannel == AaProtocol.CH_NAVIGATION) {
-                    sendEnc(targetChannel, AaProtocol.NAV_START, ByteArray(0))
-                    DiagLog.i(tag, "navigation status started on channel=$targetChannel")
+                if (channel == AaProtocol.CH_NAVIGATION) {
+                    sendEnc(channel, AaProtocol.NAV_START, ByteArray(0))
+                    DiagLog.i(tag, "instrument cluster navigation requested")
                 }
             }
-            AaProtocol.PING_REQUEST -> {
-                DiagLog.d(tag, "phone ping request received")
-                sendEnc(AaProtocol.CH_CONTROL, AaProtocol.PING_RESPONSE, AaMessages.pingResponse(AaMessages.pingTimestamp(body)))
-            }
-            AaProtocol.PING_RESPONSE -> {
-                val echoed = AaMessages.pingTimestamp(body)
-                val now = android.os.SystemClock.elapsedRealtime()
-                val sent = lastPingToken.get()
-                if (echoed == sent && sent != 0L) {
-                    lastPingResponseToken.set(echoed)
-                    val count = pingResponses.incrementAndGet()
-                    DiagLog.i(tag, "phone ping response #$count rttMs=${(now - sent).coerceAtLeast(0L)}")
-                } else {
-                    DiagLog.w(tag, "unexpected ping response echoed=$echoed lastSent=$sent")
-                }
-            }
+            AaProtocol.PING_REQUEST -> sendEnc(AaProtocol.CH_CONTROL, AaProtocol.PING_RESPONSE, AaMessages.pingResponse(AaMessages.pingTimestamp(body)))
+            AaProtocol.PING_RESPONSE -> Unit
             AaProtocol.AUDIO_FOCUS_REQUEST -> {
                 val req = AaMessages.audioFocusRequestType(body)
                 val state = if (req == AaProtocol.AUDIO_REQUEST_RELEASE) AaProtocol.AUDIO_FOCUS_LOSS else AaProtocol.AUDIO_FOCUS_GAIN
@@ -306,12 +224,11 @@ class AaSession(
                 close("bye-bye")
             }
             AaProtocol.CHANNEL_CLOSE_NOTIFICATION -> {
-                val targetChannel = AaMessages.channelOpenChannelId(body).takeIf { it in 1 until CHANNEL_COUNTERS } ?: channel
-                openChannels -= targetChannel
-                if (targetChannel == AaProtocol.CH_NAVIGATION) synchronized(navigation) {
+                openChannels -= channel
+                if (channel == AaProtocol.CH_NAVIGATION) synchronized(navigation) {
                     AaHeadUnitService.onNavigation?.invoke(navigation.reset())
                 }
-                DiagLog.i(tag, "channel close notification target=$targetChannel (${AaProtocol.channelName(targetChannel)})")
+                DiagLog.i(tag, "channel close ${AaProtocol.channelName(channel)}")
             }
             AaProtocol.VOICE_SESSION_NOTIFICATION -> Unit
             else -> DiagLog.w(tag, "unhandled control ${AaProtocol.controlName(id)} on ${AaProtocol.channelName(channel)}")
@@ -342,14 +259,11 @@ class AaSession(
         }
         when (id) {
             AaProtocol.AV_SETUP_REQUEST -> {
-                val configIndex = AaMessages.setupConfigIndex(body)
-                DiagLog.i(tag, "video setup requested configIndex=$configIndex; echoing it in AV_SETUP_RESPONSE")
-                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse(configIndex = configIndex))
-                // This is a proactive focus grant, not a reply to a phone focus request.
-                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, true))
+                DiagLog.i(tag, "video setup config=${AaMessages.setupConfigIndex(body)}")
+                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse())
+                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, false))
             }
             AaProtocol.AV_START_INDICATION -> {
-                DiagLog.w(tag, "VIDEO EVENT: AV_START_INDICATION bodyBytes=${body.size}")
                 hasStreamed = true
                 videoSession = AaMessages.startSession(body)
                 mediaFrames = 0
@@ -374,47 +288,20 @@ class AaSession(
                         val rawAge = if (lastRawVideoFrameAtMs == 0L) -1L else now - lastRawVideoFrameAtMs
                         val rawCount = rawVideoFrames.get()
                         val packetCount = videoPackets.get()
-                        val anyRawAge = if (lastAnyRawFrameAtMs == 0L) -1L else now - lastAnyRawFrameAtMs
-                        val rawChannels = (0 until CHANNEL_COUNTERS).mapNotNull { ch ->
-                            val count = rawFramesByChannel.get(ch)
-                            if (count == 0L) null else "$ch:$count/${rawBytesByChannel.get(ch)}"
-                        }.joinToString(",")
-                        val dispatchedChannels = (0 until CHANNEL_COUNTERS).mapNotNull { ch ->
-                            val count = dispatchedMessagesByChannel.get(ch)
-                            if (count == 0L) null else "$ch:$count(last=0x${Integer.toHexString(lastDispatchedIdByChannel.get(ch))},age=${if (lastDispatchedAtByChannel.get(ch) == 0L) -1L else now - lastDispatchedAtByChannel.get(ch)}ms)"
-                        }.joinToString(",")
                         if (packetCount > 0L && age >= VIDEO_STALL_TIMEOUT_MS && videoRecoveryRequests.get() < MAX_VIDEO_RECOVERY_REQUESTS && now - lastVideoRecoveryRequestAtMs >= VIDEO_RECOVERY_INTERVAL_MS) {
                             val attempt = videoRecoveryRequests.incrementAndGet()
                             lastVideoRecoveryRequestAtMs = now
                             DiagLog.w(tag, "video stream stalled for ${age}ms; requesting a fresh picture (attempt $attempt/$MAX_VIDEO_RECOVERY_REQUESTS)")
                             askForAFreshPicture()
                         }
-                        DiagLog.i(tag, "transport session=" + monitoredSession +
-                            " phase=" + _phase.value +
-                            " totalRawFrames=" + totalRawFrames.get() +
-                            " anyRawAgeMs=" + anyRawAge +
-                            " rawByChannel=[" + rawChannels + "]" +
-                            " dispatchedByChannel=[" + dispatchedChannels + "]" +
-                            " videoRawFrames=" + rawCount +
-                            " videoRawBytes=" + rawVideoBytes.get() +
-                            " videoRawAgeMs=" + rawAge +
-                            " videoPackets=" + packetCount +
-                            " videoPayloadBytes=" + videoPayloadBytes.get() +
-                            " videoFramesParsed=" + mediaFrames +
-                            " videoMalformed=" + videoMalformedPackets.get() +
-                            " videoLastPacketAgeMs=" + age +
-                            " videoLastPacketBytes=" + lastVideoPacketBytes +
-                            " videoRecoveryRequests=" + videoRecoveryRequests.get() +
-                            " videoAcksSent=" + outboundVideoAcks.get() +
-                            " decoderRendered=" + decoder.frames.value)
+                        DiagLog.i(tag, "video transport session=" + monitoredSession + " rawFrames=" + rawCount + " rawBytes=" + rawVideoBytes.get() + " rawAgeMs=" + rawAge + " dispatchedPackets=" + packetCount + " payloadBytes=" + videoPayloadBytes.get() + " framesParsed=" + mediaFrames + " malformed=" + videoMalformedPackets.get() + " lastPacketAgeMs=" + age + " lastPacketBytes=" + lastVideoPacketBytes + " recoveryRequests=" + videoRecoveryRequests.get() + " decoderRendered=" + decoder.frames.value)
                     }
                 }
                 decoder.askForAFreshPicture = { scope.launch { askForAFreshPicture() } }
                 DiagLog.i(tag, "video start session=$videoSession")
-                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, true))
+                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, false))
             }
             AaProtocol.AV_STOP_INDICATION -> {
-                DiagLog.w(tag, "VIDEO EVENT: AV_STOP_INDICATION bodyBytes=${body.size}")
                 DiagLog.i(tag, "video stop")
                 videoMonitor?.cancel()
                 videoMonitor = null
@@ -471,11 +358,7 @@ class AaSession(
 
     private fun handleAudioSink(channel: Int, id: Int, body: ByteArray) {
         when (id) {
-            AaProtocol.AV_SETUP_REQUEST -> {
-                val configIndex = AaMessages.setupConfigIndex(body)
-                DiagLog.i(tag, "${AaProtocol.channelName(channel)} setup configIndex=$configIndex; echoing selected config")
-                sendEnc(channel, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse(configIndex = configIndex))
-            }
+            AaProtocol.AV_SETUP_REQUEST -> sendEnc(channel, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse())
             AaProtocol.AV_START_INDICATION -> {
                 audioSessions[channel] = AaMessages.startSession(body)
                 audioMeasured -= channel
@@ -524,47 +407,10 @@ class AaSession(
         sendMicrophone(pcm)
     }
 
-    private fun startTransportMonitor() {
-        if (transportMonitorJob != null) return
-        transportMonitorJob = scope.launch {
-            while (isActive && lifecycle.running) {
-                delay(5_000)
-                val now = android.os.SystemClock.elapsedRealtime()
-                val readStarted = lastReadStartedAtMs.get()
-                val readCompleted = lastReadCompletedAtMs.get()
-                val blockedFor = if (readStarted == 0L) -1L else now - readStarted
-                val sinceRx = if (readCompleted == 0L) -1L else now - readCompleted
-                val sinceTx = if (lastWriteAtMs.get() == 0L) -1L else now - lastWriteAtMs.get()
-                val socket = runCatching { transportState() }.getOrElse { "stateError=${it.javaClass.simpleName}" }
-                DiagLog.i(tag, "transport health phase=${_phase.value} readCalls=${readCalls.get()} readBlockedMs=$blockedFor sinceRxMs=$sinceRx sinceTxMs=$sinceTx outboundFrames=${outboundFrames.get()} pingResponses=${pingResponses.get()} missedPingRounds=${missedPingRounds.get()} openChannels=${synchronized(openChannels) { openChannels.toList().sorted() }} socket={$socket}")
-            }
-        }
-    }
-
-    private fun startKeepalive() {
-        if (keepaliveJob != null) return
-        keepaliveJob = scope.launch {
-            while (isActive && lifecycle.running) {
-                delay(15_000)
-                if (!lifecycle.running || _phase.value < Phase.AUTHENTICATED) continue
-                val previous = lastPingToken.get()
-                if (previous != 0L && lastPingResponseToken.get() != previous) {
-                    val missed = missedPingRounds.incrementAndGet()
-                    DiagLog.w(tag, "keepalive ping unanswered round=$missed token=$previous; transport read may still be open")
-                }
-                val token = android.os.SystemClock.elapsedRealtime()
-                lastPingToken.set(token)
-                sendEnc(AaProtocol.CH_CONTROL, AaProtocol.PING_REQUEST, AaMessages.pingRequest(token))
-                DiagLog.d(tag, "keepalive ping sent token=$token")
-            }
-        }
-    }
-
     companion object {
         private const val VIDEO_STALL_TIMEOUT_MS = 5_000L
         private const val VIDEO_RECOVERY_INTERVAL_MS = 10_000L
         private const val MAX_VIDEO_RECOVERY_REQUESTS = 3L
-        private const val CHANNEL_COUNTERS = 16
     }
 
     private fun sendMicrophone(pcm: ByteArray) {
@@ -577,10 +423,7 @@ class AaSession(
 
     private fun handleAvInput(id: Int, body: ByteArray) {
         when (id) {
-            AaProtocol.AV_SETUP_REQUEST -> {
-                val configIndex = AaMessages.setupConfigIndex(body)
-                sendEnc(AaProtocol.CH_AV_INPUT, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse(configIndex = configIndex))
-            }
+            AaProtocol.AV_SETUP_REQUEST -> sendEnc(AaProtocol.CH_AV_INPUT, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse())
             AaProtocol.AV_INPUT_OPEN_REQUEST -> {
                 val wanted = AaMessages.avInputOpenWanted(body)
                 sendEnc(AaProtocol.CH_AV_INPUT, AaProtocol.AV_INPUT_OPEN_RESPONSE, AaMessages.avInputOpenResponse(if (wanted) 0 else AaMessages.avInputOpenSession(body)))
