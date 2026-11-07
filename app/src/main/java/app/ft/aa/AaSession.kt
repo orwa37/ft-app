@@ -40,6 +40,10 @@ class AaSession(
     @Volatile private var lastControlTxAtMs = 0L
     @Volatile private var lastControlRx = "none"
     @Volatile private var lastControlTx = "none"
+    @Volatile private var lastWireRxAtMs = 0L
+    @Volatile private var lastWireRx = "none"
+    @Volatile private var lastWireTxAtMs = 0L
+    @Volatile private var lastWireTx = "none"
     private val lifecycle = AaSessionLifecycle(
         interrupt = {
             runCatching { input.close() }
@@ -98,6 +102,8 @@ class AaSession(
                 DiagLog.i(tag, "version request sent")
                 while (isActive && lifecycle.running) {
                     val frame = AaFraming.readFrame(input)
+                    lastWireRxAtMs = android.os.SystemClock.elapsedRealtime()
+                    lastWireRx = "channel=${AaProtocol.channelName(frame.channel)} flags=0x${Integer.toHexString(frame.flags)} type=${frame.frameType} encrypted=${frame.encrypted} payloadBytes=${frame.payload.size}"
                     if (frame.channel == AaProtocol.CH_VIDEO) {
                         val rawCount = rawVideoFrames.incrementAndGet()
                         rawVideoBytes.addAndGet(frame.payload.size.toLong())
@@ -113,7 +119,7 @@ class AaSession(
             } catch (t: Throwable) {
                 reason = "read ${t.javaClass.simpleName}: ${t.message}"
                 if (lifecycle.running) DiagLog.w(tag, "session ended: $reason")
-                DiagLog.w(tag, "AAP EOF context session=$sessionId phase=${_phase.value} lastControlRx='$lastControlRx' rxAgeMs=${age(lastControlRxAtMs)} lastControlTx='$lastControlTx' txAgeMs=${age(lastControlTxAtMs)} videoSession=$videoSession videoPackets=${videoPackets.get()} rawVideoFrames=${rawVideoFrames.get()}")
+                DiagLog.w(tag, "AAP EOF context session=$sessionId phase=${_phase.value} lastControlRx='$lastControlRx' controlRxAgeMs=${age(lastControlRxAtMs)} lastControlTx='$lastControlTx' controlTxAgeMs=${age(lastControlTxAtMs)} lastWireRx='$lastWireRx' wireRxAgeMs=${age(lastWireRxAtMs)} lastWireTx='$lastWireTx' wireTxAgeMs=${age(lastWireTxAtMs)} videoSession=$videoSession videoPackets=${videoPackets.get()} rawVideoFrames=${rawVideoFrames.get()}")
             } finally {
                 close(reason)
             }
@@ -144,8 +150,14 @@ class AaSession(
             if (!lifecycle.running) return
             try {
                 val frames = AaFraming.encode(channel, payload, encrypted, protocolControl) { if (encrypted) crypto.encrypt(it) else it }
-                frames.forEach { output.write(it) }
+                var wireBytes = 0
+                frames.forEach {
+                    output.write(it)
+                    wireBytes += it.size
+                }
                 output.flush()
+                lastWireTxAtMs = android.os.SystemClock.elapsedRealtime()
+                lastWireTx = "channel=${AaProtocol.channelName(channel)} id=0x%04X bodyBytes=${body.size} wireBytes=$wireBytes frames=${frames.size}".format(id)
                 null
             } catch (t: Throwable) {
                 t
