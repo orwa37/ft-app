@@ -133,7 +133,8 @@ class AaSession(
         val failure = synchronized(outLock) {
             if (!lifecycle.running) return
             try {
-                val frames = AaFraming.encode(channel, payload, encrypted, control) { if (encrypted) crypto.encrypt(it) else it }
+                val protocolControl = control || (channel != AaProtocol.CH_CONTROL && id in 1..26)
+                val frames = AaFraming.encode(channel, payload, encrypted, protocolControl) { if (encrypted) crypto.encrypt(it) else it }
                 frames.forEach { output.write(it) }
                 output.flush()
                 null
@@ -204,6 +205,9 @@ class AaSession(
                 openChannels += channel
                 DiagLog.i(tag, "channel open ${AaProtocol.channelName(channel)} (service $sid)")
                 sendEnc(channel, AaProtocol.CHANNEL_OPEN_RESPONSE, AaMessages.channelOpenResponse(), true)
+                if (channel == AaProtocol.CH_SENSOR) {
+                    sendEnc(channel, AaProtocol.SENSOR_EVENT_INDICATION, AaMessages.sensorDrivingStatus(0))
+                }
                 if (channel == AaProtocol.CH_NAVIGATION) {
                     sendEnc(channel, AaProtocol.NAV_START, ByteArray(0))
                     DiagLog.i(tag, "instrument cluster navigation requested")
@@ -261,7 +265,7 @@ class AaSession(
             AaProtocol.AV_SETUP_REQUEST -> {
                 DiagLog.i(tag, "video setup config=${AaMessages.setupConfigIndex(body)}")
                 sendEnc(AaProtocol.CH_VIDEO, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse())
-                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, false))
+                sendEnc(AaProtocol.CH_VIDEO, AaProtocol.VIDEO_FOCUS_INDICATION, AaMessages.videoFocusIndication(AaProtocol.VIDEO_FOCUS_PROJECTED, true))
             }
             AaProtocol.AV_START_INDICATION -> {
                 hasStreamed = true
