@@ -226,7 +226,7 @@ class AaHeadUnitService : Service() {
                 val sessionJob = SupervisorJob(scope.coroutineContext[Job])
                 val sessionScope = CoroutineScope(scope.coroutineContext + sessionJob)
                 lateinit var session: AaSession
-                session = AaSession(this, AaSocketTrace.input(s, id, source), AaSocketTrace.output(s, id, source), (application as FTApp).prefs, sessionScope, dec) { reason ->
+                session = AaSession(this, AaSocketTrace.input(s, id, source), AaSocketTrace.output(s, id, source), (application as FTApp).prefs, sessionScope, dec, id) { reason ->
                     val details = "#$id $source ${SystemClock.elapsedRealtime() - since}ms: $reason; ${phoneState()}"
                     DiagLog.i(tag, "phone session over: $details")
                     runCatching { s.close() }
