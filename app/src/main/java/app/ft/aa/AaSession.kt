@@ -176,11 +176,10 @@ class AaSession(
         val failure = synchronized(outLock) {
             if (!lifecycle.running) return
             try {
-                // GAL framing marks every channel-0 message as CONTROL (bit 2),
-                // including version/auth/SDP/ping/open responses. Service channels
-                // remain SPECIFIC unless a caller explicitly requests otherwise.
-                val messageIsControl = control || channel == AaProtocol.CH_CONTROL
-                val frames = AaFraming.encode(channel, payload, encrypted, messageIsControl) { if (encrypted) crypto.encrypt(it) else it }
+                // CONTROL is a per-message flag, not something implied by channel 0.
+                // VERSION/TLS/auth and other channel-0 messages use BULK flags; control
+                // messages carried on service channels explicitly opt in at the call site.
+                val frames = AaFraming.encode(channel, payload, encrypted, control) { if (encrypted) crypto.encrypt(it) else it }
                 if (channel == AaProtocol.CH_CONTROL && outboundFrames.get() < 40L) {
                     val flags = frames.firstOrNull()?.getOrNull(1)?.toInt()?.and(0xff) ?: -1
                     DiagLog.d(tag, "TX CONTROL ${AaProtocol.controlName(id)} encrypted=$encrypted flags=0x${Integer.toHexString(flags)} bytes=${body.size}")
@@ -270,10 +269,9 @@ class AaSession(
                 }
                 openChannels += targetChannel
                 DiagLog.i(tag, "channel open request priority=$priority frameChannel=$channel targetChannel=$targetChannel (${AaProtocol.channelName(targetChannel)})")
-                // CHANNEL_OPEN_RESPONSE is a control-plane acknowledgement. Keep it on
-                // channel 0 with the control flag, even when the request arrived on a
-                // service channel (some Android Auto builds deliver it that way).
-                sendEnc(AaProtocol.CH_CONTROL, AaProtocol.CHANNEL_OPEN_RESPONSE, AaMessages.channelOpenResponse(), true)
+                // Android Auto carries CHANNEL_OPEN_REQUEST on the service channel;
+                // acknowledge on that same incoming channel with the CONTROL flag.
+                sendEnc(channel, AaProtocol.CHANNEL_OPEN_RESPONSE, AaMessages.channelOpenResponse(), true)
                 if (targetChannel == AaProtocol.CH_NAVIGATION) {
                     sendEnc(targetChannel, AaProtocol.NAV_START, ByteArray(0))
                     DiagLog.i(tag, "navigation status started on channel=$targetChannel")
