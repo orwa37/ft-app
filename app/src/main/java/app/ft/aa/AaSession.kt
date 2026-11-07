@@ -217,8 +217,9 @@ class AaSession(
             AaProtocol.PING_RESPONSE -> Unit
             AaProtocol.AUDIO_FOCUS_REQUEST -> {
                 val req = AaMessages.audioFocusRequestType(body)
-                val state = if (req == AaProtocol.AUDIO_REQUEST_RELEASE) AaProtocol.AUDIO_FOCUS_LOSS else AaProtocol.AUDIO_FOCUS_GAIN
-                sendEnc(AaProtocol.CH_CONTROL, AaProtocol.AUDIO_FOCUS_NOTIFICATION, AaMessages.audioFocusNotification(state))
+                AaMessages.audioFocusResponse(req)?.let {
+                    sendEnc(AaProtocol.CH_CONTROL, AaProtocol.AUDIO_FOCUS_NOTIFICATION, it)
+                } ?: DiagLog.w(tag, "unsupported audio focus request=$req")
             }
             AaProtocol.NAV_FOCUS_REQUEST -> sendEnc(AaProtocol.CH_CONTROL, AaProtocol.NAV_FOCUS_NOTIFICATION, AaMessages.navFocusNotification(AaProtocol.NAV_FOCUS_PROJECTED))
             AaProtocol.BYEBYE_REQUEST -> {
@@ -313,11 +314,9 @@ class AaSession(
                 // Headswap sends VIDEO_FOCUS only after MEDIA_SETUP, not again at MEDIA_START.
             }
             AaProtocol.AV_STOP_INDICATION -> {
-                DiagLog.i(tag, "video stop")
-                videoMonitor?.cancel()
-                videoMonitor = null
-                decoder.stop()
-                _phase.value = Phase.DISCOVERED
+                // Headswap-compatible: MEDIA_STOP on the video channel is informational.
+                // Keep the AAP session, decoder and keyframe-recovery monitor alive.
+                DiagLog.i(tag, "video MEDIA_STOP received; keeping video session active")
             }
             AaProtocol.AV_MEDIA_INDICATION -> {
                 DiagLog.i(tag, "video codec config ${body.size} bytes")
@@ -361,8 +360,8 @@ class AaSession(
                 val type = AaMessages.sensorRequestType(body)
                 sendEnc(AaProtocol.CH_SENSOR, AaProtocol.SENSOR_START_RESPONSE, AaMessages.sensorStartResponse())
                 when (type) {
-                    AaProtocol.SENSOR_DRIVING_STATUS -> sendEnc(AaProtocol.CH_SENSOR, AaProtocol.SENSOR_EVENT_INDICATION, AaMessages.sensorDrivingStatus(0))
                     AaProtocol.SENSOR_NIGHT_MODE -> sendEnc(AaProtocol.CH_SENSOR, AaProtocol.SENSOR_EVENT_INDICATION, AaMessages.sensorNightMode(false))
+                    // Driving status was already sent with CHANNEL_OPEN_RESPONSE, as in Headswap.
                     else -> Unit
                 }
                 DiagLog.i(tag, "sensor start type=$type")
@@ -373,7 +372,11 @@ class AaSession(
 
     private fun handleAudioSink(channel: Int, id: Int, body: ByteArray) {
         when (id) {
-            AaProtocol.AV_SETUP_REQUEST -> sendEnc(channel, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse())
+            AaProtocol.AV_SETUP_REQUEST -> {
+                sendEnc(channel, AaProtocol.AV_SETUP_RESPONSE, AaMessages.avSetupResponse())
+                // Headswap grants audio focus unsolicited after configuring an audio sink.
+                sendEnc(AaProtocol.CH_CONTROL, AaProtocol.AUDIO_FOCUS_NOTIFICATION, AaMessages.audioFocusGainUnsolicited())
+            }
             AaProtocol.AV_START_INDICATION -> {
                 audioSessions[channel] = AaMessages.startSession(body)
                 audioMeasured -= channel
