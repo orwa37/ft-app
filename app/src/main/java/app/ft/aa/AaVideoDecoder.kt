@@ -8,7 +8,6 @@ import android.view.Surface
 import app.ft.core.DiagLog
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -187,9 +186,8 @@ class AaVideoDecoder(private val width: Int, private val height: Int) {
             nextStartAttemptAt = 0L
             DiagLog.i(tag, "decoder started ${width}x$height on ${runCatching { c.name }.getOrNull()} generation=$mine surface=${System.identityHashCode(s)}")
             if (missed > 0) {
-                DiagLog.i(tag, "the car screen was not ready for $missed of Android Auto's pictures, asking it for a fresh one")
+                DiagLog.i(tag, "skipped $missed pictures while waiting for a keyframe or a usable decoder")
                 missed = 0
-                runCatching { askForAFreshPicture?.invoke() }
             }
         } catch (t: Throwable) {
             running.set(false)
