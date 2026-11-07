@@ -78,7 +78,6 @@ object AaMessages {
                     .enum(1, AaProtocol.CODEC_AUDIO_PCM)
                     .enum(2, type)
                     .message(3, ProtoWriter().uint32(1, rate).uint32(2, 16).uint32(3, channels))
-                    .bool(5, true)
             )
         // Match Headswap's default: system audio is always present; extra media/speech
         // sinks are opt-in because some Android Auto builds open them during display setup.
