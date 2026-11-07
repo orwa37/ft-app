@@ -226,17 +226,7 @@ class AaHeadUnitService : Service() {
                 val sessionJob = SupervisorJob(scope.coroutineContext[Job])
                 val sessionScope = CoroutineScope(scope.coroutineContext + sessionJob)
                 lateinit var session: AaSession
-                session = AaSession(
-                    this,
-                    s.getInputStream(),
-                    s.getOutputStream(),
-                    {
-                        "connected=${s.isConnected} closed=${s.isClosed} inputShutdown=${s.isInputShutdown} outputShutdown=${s.isOutputShutdown} soTimeout=${s.soTimeout} tcpNoDelay=${s.tcpNoDelay} keepAlive=${s.keepAlive}"
-                    },
-                    (application as FTApp).prefs,
-                    sessionScope,
-                    dec
-                ) { reason ->
+                session = AaSession(this, s.getInputStream(), s.getOutputStream(), (application as FTApp).prefs, sessionScope, dec) { reason ->
                     val details = "#$id $source ${SystemClock.elapsedRealtime() - since}ms: $reason; ${phoneState()}"
                     DiagLog.i(tag, "phone session over: $details")
                     runCatching { s.close() }
